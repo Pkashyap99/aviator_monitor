@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Aviator Predictor</title>
+    <link rel="stylesheet" href="/styles.css?v=20260808-context-hint">
+  </head>
+  <body>
+    <main class="shell">
+      <section class="fast-prediction" aria-label="Fast prediction">
+        <div class="fast-main">
+          <p class="eyebrow">Next round prediction</p>
+          <strong id="fastPredictionText">Waiting for data</strong>
+          <small id="signalStrengthText" class="signal-strength">Signal: waiting</small>
+          <span id="fastPredictionMeta">--</span>
+          <small id="bigWatchText" class="big-watch">Big multiplier watch: --</small>
+        </div>
+        <div class="fast-side">
+          <span>Live data</span>
+          <strong id="fastSignalText">Checking</strong>
+          <small id="cashoutGuideText">--</small>
+        </div>
+      </section>
+
+      <section class="quick-context" aria-label="Current status">
+        <article class="stat primary">
+          <span>Latest</span>
+          <strong id="latestMultiplier">--</strong>
+        </article>
+        <article class="stat">
+          <span>Rounds</span>
+          <strong id="roundCount">--</strong>
+        </article>
+        <article class="panel">
+          <p class="eyebrow">Previous result</p>
+          <strong id="previousPredictionStatus" class="previous-status">Waiting</strong>
+          <div id="trackingSummary" class="tracking-summary"></div>
+          <div id="sourceModeText" class="source-mode">Data: checking</div>
+          <div id="roundContextText" class="context-mode">Context: waiting</div>
+          <div id="accuracySummaryText" class="accuracy-summary">Accuracy: waiting</div>
+        </article>
+      </section>
+
+      <section class="is-hidden" aria-hidden="true">
+        <div class="status">
+          <span class="pulse" aria-hidden="true"></span>
+          <span id="statusText">Connecting</span>
+        </div>
+        <label>
+          Pattern
+          <select id="lookbackSelect">
+            <option value="1">1 round</option>
+            <option value="2" selected>2 rounds</option>
+            <option value="3">3 rounds</option>
+            <option value="4">4 rounds</option>
+            <option value="5">5 rounds</option>
+          </select>
+        </label>
+        <label>
+          Min matches
+          <select id="minMatchesSelect">
+            <option value="3">3</option>
+            <option value="5" selected>5</option>
+            <option value="10">10</option>
+            <option value="20">20</option>
+          </select>
+        </label>
+        <button id="refreshButton" type="button">Refresh</button>
+        <strong id="medianValue">--</strong>
+        <strong id="p90Value">--</strong>
+        <strong id="maxValue">--</strong>
+        <span id="lastUpdated">--</span>
+        <div id="latestPattern">--</div>
+        <p id="matchCount">--</p>
+        <div id="predictionList"></div>
+        <small id="signalStrengthTextHidden">--</small>
+        <small id="bigWatchTextHidden">--</small>
+        <small id="cashoutGuideTextHidden">--</small>
+        <article class="panel">
+          <div id="overallList" class="bars"></div>
+        </article>
+        <div id="trackingList"></div>
+        <div id="accuracySummaryTextHidden">--</div>
+        <div id="sourceModeTextHidden">--</div>
+        <div id="recentRounds"></div>
+        <div id="backtestList"></div>
+        <canvas id="roundChart" width="1100" height="360"></canvas>
+        <p id="riskNote"></p>
+      </section>
+    </main>
+
+    <script src="/app.js?v=20260808-live-participants"></script>
+  </body>
+</html>

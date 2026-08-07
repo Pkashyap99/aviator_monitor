@@ -1,0 +1,3388 @@
+import asyncio
+import csv
+import fcntl
+import hashlib
+import json
+import os
+import re
+import shutil
+import time
+from datetime import datetime
+from pathlib import Path
+from urllib.parse import urlparse
+
+from playwright.async_api import async_playwright
+
+
+# =========================================================
+# PATHS
+# =========================================================
+
+ROOT = Path(__file__).resolve().parent
+
+DATA_DIR = ROOT / "data"
+
+CSV_PATH = DATA_DIR / "rounds.csv"
+
+ROUND_IDS_PATH = DATA_DIR / "round_ids.csv"
+
+PROVABLY_FAIR_PATH = DATA_DIR / "provably_fair.csv"
+
+ROUND_CONTEXT_PATH = DATA_DIR / "round_context.csv"
+
+LOG_PATH = DATA_DIR / "collector.log"
+
+CONFIG_PATH = ROOT / "config.json"
+
+STATE_PATH = DATA_DIR / "state.json"
+
+LOCK_PATH = DATA_DIR / "collector.lock"
+
+BACKUP_DIR = DATA_DIR / "backups"
+
+CSV_HEADERS = [
+    "timestamp",
+    "multiplier",
+    "round_id",
+    "source",
+]
+
+ROUND_ID_HEADERS = [
+    "observed_at",
+    "round_id",
+    "source",
+]
+
+PROVABLY_FAIR_HEADERS = [
+    "observed_at",
+    "next_seed",
+    "server_next_hash",
+    "source",
+]
+
+ROUND_CONTEXT_HEADERS = [
+    "observed_at",
+    "round_id",
+    "source",
+    "game_source",
+    "player_count",
+    "bet_count",
+    "total_bet",
+    "avg_bet",
+    "max_bet",
+    "cashed_out_count",
+    "avg_cashout",
+    "max_cashout",
+    "total_win",
+    "max_win",
+    "payload_records",
+    "context_hash",
+]
+
+MAX_NEW_VALUES_PER_SCAN = 8
+
+MAX_STARTUP_RECOVERY_VALUES = 20
+
+MAX_ROUNDS_BACKUPS = 30
+
+PAGE_WATCHER_INTERVAL_MS = 25
+
+DEFAULT_SNAPSHOT_SCAN_SECONDS = 0.2
+
+
+# =========================================================
+# MULTIPLIER REGEX
+# =========================================================
+
+MULTIPLIER_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)(?:x)?\s*$")
+
+NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
+
+ROUND_ID_KEYS = {
+    "roundid",
+    "round",
+    "gameroundid",
+    "betroundid",
+}
+
+BET_AMOUNT_KEYS = {
+    "amount",
+    "bet",
+    "betamount",
+    "betvalue",
+    "stake",
+    "wager",
+}
+
+CASHOUT_MULTIPLIER_KEYS = {
+    "cashout",
+    "cashoutat",
+    "cashoutmultiplier",
+    "cashoutcoefficient",
+    "cashoutcoef",
+}
+
+WIN_AMOUNT_KEYS = {
+    "win",
+    "won",
+    "winamount",
+    "payout",
+    "profit",
+    "cashoutamount",
+}
+
+PLAYER_KEYS = {
+    "playerid",
+    "userid",
+    "user",
+    "username",
+    "nickname",
+    "playername",
+    "name",
+}
+
+STATUS_KEYS = {
+    "status",
+    "state",
+    "result",
+    "betstatus",
+}
+
+CONTEXT_RESPONSE_MARKERS = (
+    "getuserbets",
+    "bets",
+    "round",
+    "history",
+    "cashout",
+)
+
+DEFAULT_PARTICIPANT_COUNT_SELECTOR = ".flight-radar-participants-count"
+
+PARTICIPANT_SCAN_SECONDS = 0.5
+
+PARTICIPANT_MIN_WRITE_SECONDS = 1
+
+PARTICIPANT_HEARTBEAT_SECONDS = 30
+
+PARTICIPANT_TABLE_SCAN_SECONDS = 1
+
+PARTICIPANT_TABLE_HEARTBEAT_SECONDS = 2
+
+
+# =========================================================
+# HELPERS
+# =========================================================
+
+def now_string():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def timestamp_from_millis(milliseconds):
+    try:
+        return datetime.fromtimestamp(
+            float(milliseconds) / 1000
+        ).strftime("%Y-%m-%d %H:%M:%S")
+    except (TypeError, ValueError, OSError):
+        return now_string()
+
+
+def file_timestamp():
+    return datetime.now().strftime("%Y%m%d-%H%M%S")
+
+
+def log(message):
+    DATA_DIR.mkdir(exist_ok=True)
+
+    line = f"[{now_string()}] {message}"
+
+    print(line)
+
+    with LOG_PATH.open("a", encoding="utf-8") as f:
+        f.write(line + "\n")
+
+
+def load_config():
+    if not CONFIG_PATH.exists():
+        raise SystemExit(
+            "config.json not found.\n"
+            "Create config.json first."
+        )
+
+    with CONFIG_PATH.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def ensure_files():
+
+    DATA_DIR.mkdir(exist_ok=True)
+
+    if not ROUND_CONTEXT_PATH.exists():
+
+        with ROUND_CONTEXT_PATH.open(
+            "w",
+            newline="",
+            encoding="utf-8"
+        ) as f:
+
+            writer = csv.writer(f)
+
+            writer.writerow(
+                ROUND_CONTEXT_HEADERS
+            )
+
+    if not ROUND_IDS_PATH.exists():
+
+        with ROUND_IDS_PATH.open(
+            "w",
+            newline="",
+            encoding="utf-8"
+        ) as f:
+
+            writer = csv.writer(f)
+
+            writer.writerow(
+                ROUND_ID_HEADERS
+            )
+
+    if not PROVABLY_FAIR_PATH.exists():
+
+        with PROVABLY_FAIR_PATH.open(
+            "w",
+            newline="",
+            encoding="utf-8"
+        ) as f:
+
+            writer = csv.writer(f)
+
+            writer.writerow(
+                PROVABLY_FAIR_HEADERS
+            )
+
+    if not CSV_PATH.exists():
+
+        with CSV_PATH.open(
+            "w",
+            newline="",
+            encoding="utf-8"
+        ) as f:
+
+            writer = csv.writer(f)
+
+            writer.writerow(
+                CSV_HEADERS
+            )
+
+        return
+
+    with CSV_PATH.open(
+        "r",
+        newline="",
+        encoding="utf-8"
+    ) as f:
+
+        reader = csv.DictReader(f)
+        fieldnames = reader.fieldnames or []
+
+        missing_headers = [
+            header
+            for header in CSV_HEADERS
+            if header not in fieldnames
+        ]
+
+        if not missing_headers:
+            return
+
+        rows = list(reader)
+
+    migration_backup = BACKUP_DIR / f"rounds-before-schema-update-{file_timestamp()}.csv"
+    BACKUP_DIR.mkdir(exist_ok=True)
+    shutil.copy2(
+        CSV_PATH,
+        migration_backup
+    )
+
+    with CSV_PATH.open(
+        "w",
+        newline="",
+        encoding="utf-8"
+    ) as f:
+
+        writer = csv.DictWriter(
+            f,
+            fieldnames=CSV_HEADERS
+        )
+        writer.writeheader()
+
+        for row in rows:
+            writer.writerow(
+                {
+                    "timestamp": row.get(
+                        "timestamp",
+                        ""
+                    ),
+                    "multiplier": row.get(
+                        "multiplier",
+                        ""
+                    ),
+                    "round_id": row.get(
+                        "round_id",
+                        ""
+                    ),
+                    "source": row.get(
+                        "source",
+                        ""
+                    ),
+                }
+            )
+
+    log(
+        "Updated rounds CSV schema "
+        f"({', '.join(missing_headers)}). Backup: {migration_backup.name}"
+    )
+
+
+def load_observed_round_ids():
+    if not ROUND_IDS_PATH.exists():
+        return set()
+
+    observed = set()
+
+    try:
+        with ROUND_IDS_PATH.open(
+            "r",
+            newline="",
+            encoding="utf-8"
+        ) as f:
+            reader = csv.DictReader(f)
+
+            for row in reader:
+                round_id = row.get(
+                    "round_id",
+                    ""
+                )
+
+                if round_id:
+                    observed.add(
+                        str(round_id)
+                    )
+
+    except OSError:
+        return set()
+
+    return observed
+
+
+def append_observed_round_id(round_id, source):
+    if round_id is None:
+        return
+
+    with ROUND_IDS_PATH.open(
+        "a",
+        newline="",
+        encoding="utf-8"
+    ) as f:
+
+        writer = csv.writer(f)
+
+        writer.writerow(
+            [
+                now_string(),
+                str(round_id),
+                source,
+            ]
+        )
+
+
+def load_observed_seed_pairs():
+    if not PROVABLY_FAIR_PATH.exists():
+        return set()
+
+    observed = set()
+
+    try:
+        with PROVABLY_FAIR_PATH.open(
+            "r",
+            newline="",
+            encoding="utf-8"
+        ) as f:
+            reader = csv.DictReader(f)
+
+            for row in reader:
+                seed = row.get(
+                    "next_seed",
+                    ""
+                )
+                server_hash = row.get(
+                    "server_next_hash",
+                    ""
+                )
+
+                if seed or server_hash:
+                    observed.add(
+                        (
+                            seed,
+                            server_hash
+                        )
+                    )
+
+    except OSError:
+        return set()
+
+    return observed
+
+
+def append_provably_fair_seed(next_seed, server_next_hash, source):
+    if not next_seed and not server_next_hash:
+        return
+
+    with PROVABLY_FAIR_PATH.open(
+        "a",
+        newline="",
+        encoding="utf-8"
+    ) as f:
+
+        writer = csv.writer(f)
+
+        writer.writerow(
+            [
+                now_string(),
+                next_seed or "",
+                server_next_hash or "",
+                source,
+            ]
+        )
+
+
+def load_observed_context_hashes():
+    if not ROUND_CONTEXT_PATH.exists():
+        return set()
+
+    observed = set()
+
+    try:
+        with ROUND_CONTEXT_PATH.open(
+            "r",
+            newline="",
+            encoding="utf-8"
+        ) as f:
+            reader = csv.DictReader(f)
+
+            for row in reader:
+                context_hash = row.get(
+                    "context_hash",
+                    ""
+                )
+
+                if context_hash:
+                    observed.add(
+                        context_hash
+                    )
+
+    except OSError:
+        return set()
+
+    return observed
+
+
+def normalize_payload_key(key):
+    return re.sub(
+        r"[^a-z0-9]",
+        "",
+        str(key).lower()
+    )
+
+
+def direct_payload_value(mapping, aliases):
+    if not isinstance(mapping, dict):
+        return None
+
+    for key, value in mapping.items():
+        if normalize_payload_key(key) in aliases:
+            return value
+
+    return None
+
+
+def number_from_value(value):
+    if isinstance(value, bool):
+        return None
+
+    if isinstance(value, (int, float)):
+        number = float(value)
+        return number if number == number else None
+
+    if isinstance(value, str):
+        match = NUMBER_RE.search(
+            value.replace(
+                ",",
+                ""
+            )
+        )
+
+        if not match:
+            return None
+
+        try:
+            return float(
+                match.group(0)
+            )
+        except ValueError:
+            return None
+
+    return None
+
+
+def direct_number(mapping, aliases):
+    return number_from_value(
+        direct_payload_value(
+            mapping,
+            aliases
+        )
+    )
+
+
+def extract_payload_round_id(mapping, inherited_round_id=None):
+    value = direct_payload_value(
+        mapping,
+        ROUND_ID_KEYS
+    )
+
+    if value is None:
+        return inherited_round_id
+
+    round_id = str(
+        value
+    ).strip()
+
+    return round_id or inherited_round_id
+
+
+def looks_like_bet_record(mapping):
+    if not isinstance(mapping, dict):
+        return False
+
+    has_money = any(
+        direct_number(
+            mapping,
+            aliases
+        ) is not None
+        for aliases in (
+            BET_AMOUNT_KEYS,
+            CASHOUT_MULTIPLIER_KEYS,
+            WIN_AMOUNT_KEYS,
+        )
+    )
+
+    if has_money:
+        return True
+
+    has_player = direct_payload_value(
+        mapping,
+        PLAYER_KEYS
+    ) is not None
+    has_status = direct_payload_value(
+        mapping,
+        STATUS_KEYS
+    ) is not None
+
+    return has_player and has_status
+
+
+def extract_bet_records(value, inherited_round_id=None):
+    records = []
+
+    if isinstance(value, dict):
+        round_id = extract_payload_round_id(
+            value,
+            inherited_round_id
+        )
+
+        if round_id and looks_like_bet_record(value):
+            records.append(
+                (
+                    round_id,
+                    value
+                )
+            )
+
+        for child in value.values():
+            records.extend(
+                extract_bet_records(
+                    child,
+                    round_id
+                )
+            )
+
+    elif isinstance(value, list):
+        for child in value:
+            records.extend(
+                extract_bet_records(
+                    child,
+                    inherited_round_id
+                )
+            )
+
+    return records
+
+
+def is_cashed_out_record(record, cashout_multiplier, win_amount):
+    if cashout_multiplier is not None and cashout_multiplier >= 1:
+        return True
+
+    if win_amount is not None and win_amount > 0:
+        return True
+
+    status = direct_payload_value(
+        record,
+        STATUS_KEYS
+    )
+
+    if status is None:
+        return False
+
+    status_text = str(
+        status
+    ).lower()
+
+    return any(
+        marker in status_text
+        for marker in (
+            "cash",
+            "win",
+            "success",
+            "paid",
+        )
+    )
+
+
+def finite_context_number(value, minimum=0, maximum=1_000_000_000):
+    if value is None:
+        return None
+
+    if value != value:
+        return None
+
+    if value < minimum or value > maximum:
+        return None
+
+    return value
+
+
+def summarize_round_context(payload):
+    summaries = {}
+
+    for round_id, record in extract_bet_records(payload):
+        summary = summaries.setdefault(
+            round_id,
+            {
+                "round_id": round_id,
+                "players": set(),
+                "bet_values": [],
+                "cashout_values": [],
+                "win_values": [],
+                "cashed_out_count": 0,
+                "payload_records": 0,
+            }
+        )
+
+        summary["payload_records"] += 1
+
+        player_id = direct_payload_value(
+            record,
+            PLAYER_KEYS
+        )
+
+        if player_id is not None:
+            summary["players"].add(
+                str(
+                    player_id
+                )
+            )
+
+        bet_amount = finite_context_number(
+            direct_number(
+                record,
+                BET_AMOUNT_KEYS
+            )
+        )
+        cashout_multiplier = finite_context_number(
+            direct_number(
+                record,
+                CASHOUT_MULTIPLIER_KEYS
+            ),
+            minimum=1,
+            maximum=100_000
+        )
+        win_amount = finite_context_number(
+            direct_number(
+                record,
+                WIN_AMOUNT_KEYS
+            )
+        )
+
+        if bet_amount is not None:
+            summary["bet_values"].append(
+                bet_amount
+            )
+
+        if cashout_multiplier is not None:
+            summary["cashout_values"].append(
+                cashout_multiplier
+            )
+
+        if win_amount is not None:
+            summary["win_values"].append(
+                win_amount
+            )
+
+        if is_cashed_out_record(
+            record,
+            cashout_multiplier,
+            win_amount
+        ):
+            summary["cashed_out_count"] += 1
+
+    return list(
+        summaries.values()
+    )
+
+
+def average(values):
+    if not values:
+        return None
+
+    return sum(values) / len(values)
+
+
+def context_number(value):
+    if value is None:
+        return ""
+
+    return f"{value:.2f}"
+
+
+def context_count(value):
+    if value is None:
+        return ""
+
+    return str(
+        int(value)
+    )
+
+
+def context_signature(row):
+    payload = {
+        key: row.get(
+            key,
+            ""
+        )
+        for key in ROUND_CONTEXT_HEADERS
+        if key not in (
+            "observed_at",
+            "context_hash",
+        )
+    }
+
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            sort_keys=True
+        ).encode(
+            "utf-8"
+        )
+    ).hexdigest()[:16]
+
+
+def round_context_row(summary, source, game_source):
+    bet_values = summary["bet_values"]
+    cashout_values = summary["cashout_values"]
+    win_values = summary["win_values"]
+    row = {
+        "observed_at": now_string(),
+        "round_id": summary["round_id"],
+        "source": source,
+        "game_source": game_source,
+        "player_count": context_count(
+            len(summary["players"]) if summary["players"] else None
+        ),
+        "bet_count": context_count(
+            len(bet_values) if bet_values else summary["payload_records"]
+        ),
+        "total_bet": context_number(
+            sum(bet_values) if bet_values else None
+        ),
+        "avg_bet": context_number(
+            average(
+                bet_values
+            )
+        ),
+        "max_bet": context_number(
+            max(bet_values) if bet_values else None
+        ),
+        "cashed_out_count": context_count(
+            summary["cashed_out_count"]
+        ),
+        "avg_cashout": context_number(
+            average(
+                cashout_values
+            )
+        ),
+        "max_cashout": context_number(
+            max(cashout_values) if cashout_values else None
+        ),
+        "total_win": context_number(
+            sum(win_values) if win_values else None
+        ),
+        "max_win": context_number(
+            max(win_values) if win_values else None
+        ),
+        "payload_records": context_count(
+            summary["payload_records"]
+        ),
+        "context_hash": "",
+    }
+    row["context_hash"] = context_signature(
+        row
+    )
+    return row
+
+
+def append_round_context_summaries(
+    summaries,
+    source,
+    game_source,
+    observed_hashes
+):
+    rows = []
+
+    for summary in summaries:
+        row = round_context_row(
+            summary,
+            source,
+            game_source
+        )
+
+        if row["context_hash"] in observed_hashes:
+            continue
+
+        rows.append(
+            row
+        )
+
+    if not rows:
+        return 0
+
+    with ROUND_CONTEXT_PATH.open(
+        "a",
+        newline="",
+        encoding="utf-8"
+    ) as f:
+
+        writer = csv.DictWriter(
+            f,
+            fieldnames=ROUND_CONTEXT_HEADERS
+        )
+
+        for row in rows:
+            writer.writerow(
+                row
+            )
+            observed_hashes.add(
+                row["context_hash"]
+            )
+
+        f.flush()
+        os.fsync(
+            f.fileno()
+        )
+
+    return len(rows)
+
+
+def append_participant_count_context(player_count, game_source):
+    observed_at = now_string()
+    row = {
+        "observed_at": observed_at,
+        "round_id": "",
+        "source": "flight_radar_dom",
+        "game_source": game_source,
+        "player_count": context_count(
+            player_count
+        ),
+        "bet_count": "",
+        "total_bet": "",
+        "avg_bet": "",
+        "max_bet": "",
+        "cashed_out_count": "",
+        "avg_cashout": "",
+        "max_cashout": "",
+        "total_win": "",
+        "max_win": "",
+        "payload_records": "1",
+        "context_hash": "",
+    }
+    row["context_hash"] = hashlib.sha256(
+        f"{observed_at}:flight_radar_dom:{game_source}:{player_count}".encode(
+            "utf-8"
+        )
+    ).hexdigest()[:16]
+
+    with ROUND_CONTEXT_PATH.open(
+        "a",
+        newline="",
+        encoding="utf-8"
+    ) as f:
+
+        writer = csv.DictWriter(
+            f,
+            fieldnames=ROUND_CONTEXT_HEADERS
+        )
+
+        writer.writerow(
+            row
+        )
+
+        f.flush()
+        os.fsync(
+            f.fileno()
+        )
+
+
+def visible_participants_signature(context, game_source):
+    payload = {
+        "source": "participants_dom",
+        "game_source": game_source,
+        "player_count": context.get(
+            "visible_rows"
+        ),
+        "bet_count": context.get(
+            "bet_count"
+        ),
+        "total_bet": context.get(
+            "total_bet"
+        ),
+        "cashed_out_count": context.get(
+            "cashed_out_count"
+        ),
+        "total_win": context.get(
+            "total_win"
+        ),
+    }
+
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            sort_keys=True
+        ).encode(
+            "utf-8"
+        )
+    ).hexdigest()[:16]
+
+
+def append_visible_participants_context(context, game_source):
+    row = {
+        "observed_at": now_string(),
+        "round_id": "",
+        "source": "participants_dom",
+        "game_source": game_source,
+        "player_count": context_count(
+            context.get(
+                "visible_rows"
+            )
+        ),
+        "bet_count": context_count(
+            context.get(
+                "bet_count"
+            )
+        ),
+        "total_bet": context_number(
+            context.get(
+                "total_bet"
+            )
+        ),
+        "avg_bet": context_number(
+            context.get(
+                "avg_bet"
+            )
+        ),
+        "max_bet": context_number(
+            context.get(
+                "max_bet"
+            )
+        ),
+        "cashed_out_count": context_count(
+            context.get(
+                "cashed_out_count"
+            )
+        ),
+        "avg_cashout": context_number(
+            context.get(
+                "avg_cashout"
+            )
+        ),
+        "max_cashout": context_number(
+            context.get(
+                "max_cashout"
+            )
+        ),
+        "total_win": context_number(
+            context.get(
+                "total_win"
+            )
+        ),
+        "max_win": context_number(
+            context.get(
+                "max_win"
+            )
+        ),
+        "payload_records": context_count(
+            context.get(
+                "visible_rows"
+            )
+        ),
+        "context_hash": visible_participants_signature(
+            context,
+            game_source
+        ),
+    }
+
+    with ROUND_CONTEXT_PATH.open(
+        "a",
+        newline="",
+        encoding="utf-8"
+    ) as f:
+
+        writer = csv.DictWriter(
+            f,
+            fieldnames=ROUND_CONTEXT_HEADERS
+        )
+
+        writer.writerow(
+            row
+        )
+
+        f.flush()
+        os.fsync(
+            f.fileno()
+        )
+
+
+def backup_rounds_csv():
+    if not CSV_PATH.exists():
+        return
+
+    BACKUP_DIR.mkdir(exist_ok=True)
+
+    backup_path = BACKUP_DIR / f"rounds-{file_timestamp()}.csv"
+    shutil.copy2(
+        CSV_PATH,
+        backup_path
+    )
+
+    backups = sorted(
+        BACKUP_DIR.glob("rounds-*.csv"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+
+    for old_backup in backups[MAX_ROUNDS_BACKUPS:]:
+        try:
+            old_backup.unlink()
+        except OSError:
+            pass
+
+    log(
+        f"Backed up rounds CSV to {backup_path.name}"
+    )
+
+
+def acquire_collector_lock():
+    DATA_DIR.mkdir(exist_ok=True)
+    lock_file = LOCK_PATH.open("w", encoding="utf-8")
+
+    try:
+        fcntl.flock(
+            lock_file,
+            fcntl.LOCK_EX | fcntl.LOCK_NB
+        )
+    except BlockingIOError:
+        log(
+            "Another collector is already running. Stop it before starting a new one."
+        )
+        raise SystemExit(1)
+
+    lock_file.write(
+        str(
+            time.time()
+        )
+    )
+    lock_file.flush()
+    return lock_file
+
+
+def append_round(multiplier, timestamp=None, round_id=None, source=None):
+
+    with CSV_PATH.open(
+        "a",
+        newline="",
+        encoding="utf-8"
+    ) as f:
+
+        writer = csv.writer(f)
+
+        writer.writerow(
+            [
+                timestamp or now_string(),
+                f"{multiplier:.2f}",
+                round_id or "",
+                source or "",
+            ]
+        )
+
+        f.flush()
+        os.fsync(
+            f.fileno()
+        )
+
+
+def load_state():
+
+    if not STATE_PATH.exists():
+        return {}
+
+    try:
+
+        with STATE_PATH.open(
+            "r",
+            encoding="utf-8"
+        ) as f:
+
+            return json.load(f)
+
+    except Exception:
+
+        return {}
+
+
+def save_state(snapshot):
+
+    data = {
+        "last_updated": now_string(),
+        "snapshot": snapshot
+    }
+
+    tmp_path = STATE_PATH.with_suffix(".json.tmp")
+
+    with tmp_path.open(
+        "w",
+        encoding="utf-8"
+    ) as f:
+
+        json.dump(
+            data,
+            f,
+            indent=2
+        )
+
+        f.flush()
+        os.fsync(
+            f.fileno()
+        )
+
+    tmp_path.replace(
+        STATE_PATH
+    )
+
+
+# =========================================================
+# READ MULTIPLIERS
+# =========================================================
+
+def normalize_selector_config(selector):
+    selectors = []
+
+    if isinstance(selector, list):
+        selectors.extend(selector)
+    else:
+        selectors.append(selector)
+
+    # Prefer the small history chips. Broad parent selectors can read the full
+    # history panel as one block and create false duplicate rounds.
+    selectors.extend(
+        [
+            ".px-1 > .text-w-60",
+            ".px-1 .text-w-60",
+        ]
+    )
+
+    normalized = []
+
+    for item in selectors:
+        if item and item not in normalized:
+            normalized.append(item)
+
+    return normalized
+
+
+async def read_multipliers_once(page, selector):
+
+    elements = await page.locator(selector).all()
+
+    values = []
+
+    for element in elements:
+
+        try:
+
+            if not await element.is_visible():
+                continue
+
+            text = (
+                await element.inner_text()
+            ).strip()
+
+        except Exception:
+
+            continue
+
+        match = MULTIPLIER_RE.search(text)
+
+        if not match:
+            continue
+
+        try:
+
+            value = float(
+                match.group(1)
+            )
+
+            # Basic sanity protection
+            if value >= 1:
+                values.append(
+                    round(
+                        value,
+                        2
+                    )
+                )
+
+        except ValueError:
+            continue
+
+    return values
+
+
+async def read_multipliers(page, selectors):
+
+    for selector in normalize_selector_config(
+        selectors
+    ):
+
+        try:
+
+            values = await read_multipliers_once(
+                page,
+                selector
+            )
+
+        except Exception:
+            continue
+
+        if values:
+            return values
+
+    return []
+
+
+def normalize_participant_selectors(selector):
+    selectors = []
+
+    if isinstance(selector, list):
+        selectors.extend(selector)
+    else:
+        selectors.append(selector)
+
+    selectors.append(
+        DEFAULT_PARTICIPANT_COUNT_SELECTOR
+    )
+
+    normalized = []
+
+    for item in selectors:
+        if item and item not in normalized:
+            normalized.append(item)
+
+    return normalized
+
+
+async def read_participant_count(page, selectors):
+    for selector in normalize_participant_selectors(
+        selectors
+    ):
+        try:
+            elements = await page.locator(
+                selector
+            ).all()
+        except Exception:
+            continue
+
+        for element in elements:
+            try:
+                if not await element.is_visible():
+                    continue
+
+                text = (
+                    await element.inner_text()
+                ).strip()
+
+            except Exception:
+                continue
+
+            value = number_from_value(
+                text
+            )
+
+            if value is None or value <= 0:
+                continue
+
+            return int(
+                value
+            )
+
+    return None
+
+
+async def read_visible_participants_table(page):
+    try:
+        return await page.evaluate(
+            """
+            () => {
+              const clean = (value) => (
+                value || ""
+              ).replace(/\\s+/g, " ").trim();
+
+              const bodyText = clean(document.body.innerText || "");
+
+              const parseCompactNumber = (value) => {
+                const text = clean(value).replace(/,/g, "");
+                const match = text.match(/^(\\d+(?:\\.\\d+)?)([KMB])?$/i);
+
+                if (!match) {
+                  return null;
+                }
+
+                const scale = {
+                  K: 1000,
+                  M: 1000000,
+                  B: 1000000000,
+                }[(match[2] || "").toUpperCase()] || 1;
+
+                return Number.parseFloat(match[1]) * scale;
+              };
+
+              const parseMultiplier = (value) => {
+                const text = clean(value);
+                const match = text.match(/^(\\d+(?:\\.\\d+)?)x$/i);
+
+                if (!match) {
+                  return null;
+                }
+
+                return Number.parseFloat(match[1]);
+              };
+
+              const isVisible = (node) => {
+                const rect = node.getBoundingClientRect();
+                const style = window.getComputedStyle(node);
+
+                return (
+                  rect.width > 0
+                  && rect.height > 0
+                  && style.visibility !== "hidden"
+                  && style.display !== "none"
+                );
+              };
+
+              const hasVisibleParticipantAmount = Array
+                .from(document.querySelectorAll(".players-row-amount"))
+                .some((node) => isVisible(node));
+
+              if (
+                !hasVisibleParticipantAmount
+                && (
+                  !/Participants/i.test(bodyText)
+                  || !/My bets/i.test(bodyText)
+                  || !/Promos/i.test(bodyText)
+                )
+              ) {
+                return null;
+              }
+
+              const summarizeRows = (rows) => {
+                if (!rows.length) {
+                  return null;
+                }
+
+                const sum = (values) => (
+                  values.reduce((total, value) => total + value, 0)
+                );
+                const bets = rows
+                  .map((row) => row.bet)
+                  .filter((value) => Number.isFinite(value));
+                const wins = rows
+                  .map((row) => row.win)
+                  .filter((value) => Number.isFinite(value));
+                const cashouts = rows
+                  .map((row) => row.cashout)
+                  .filter((value) => Number.isFinite(value));
+
+                if (!bets.length) {
+                  return null;
+                }
+
+                return {
+                  visible_rows: rows.length,
+                  bet_count: bets.length,
+                  total_bet: bets.length ? sum(bets) : null,
+                  avg_bet: bets.length ? sum(bets) / bets.length : null,
+                  max_bet: bets.length ? Math.max(...bets) : null,
+                  cashed_out_count: cashouts.length,
+                  avg_cashout: cashouts.length ? sum(cashouts) / cashouts.length : null,
+                  max_cashout: cashouts.length ? Math.max(...cashouts) : null,
+                  total_win: wins.length ? sum(wins) : null,
+                  max_win: wins.length ? Math.max(...wins) : null,
+                };
+              };
+
+              const findParticipantRowRoot = (amountNode) => {
+                let best = amountNode.parentElement;
+                let current = amountNode.parentElement;
+
+                for (let depth = 0; current && depth < 8; depth += 1) {
+                  const amountCount = current
+                    .querySelectorAll(".players-row-amount").length;
+                  const rect = current.getBoundingClientRect();
+
+                  if (amountCount === 1 && rect.height <= 140) {
+                    best = current;
+                    current = current.parentElement;
+                    continue;
+                  }
+
+                  break;
+                }
+
+                return best || amountNode.parentElement || amountNode;
+              };
+
+              const visibleCellItems = (root) => (
+                Array.from(root.querySelectorAll("*"))
+                  .filter((node) => isVisible(node))
+                  .map((node) => {
+                    const rect = node.getBoundingClientRect();
+
+                    return {
+                      node,
+                      text: clean(node.innerText || node.textContent || ""),
+                      x: rect.left,
+                      y: rect.top + rect.height / 2,
+                    };
+                  })
+                  .filter((item) => item.text && item.text.length <= 80)
+              );
+
+              const firstParsedFromSelectors = (root, selectors, parser) => {
+                for (const selector of selectors) {
+                  const nodes = Array.from(root.querySelectorAll(selector));
+
+                  for (const node of nodes) {
+                    if (!isVisible(node)) {
+                      continue;
+                    }
+
+                    const value = parser(
+                      node.innerText || node.textContent || ""
+                    );
+
+                    if (Number.isFinite(value)) {
+                      return value;
+                    }
+                  }
+                }
+
+                return null;
+              };
+
+              const readClassBasedParticipantRows = () => {
+                const amountNodes = Array
+                  .from(document.querySelectorAll(".players-row-amount"))
+                  .filter((node) => isVisible(node));
+                const rows = [];
+                const seen = new Set();
+
+                for (const amountNode of amountNodes) {
+                  const bet = parseCompactNumber(
+                    amountNode.innerText || amountNode.textContent || ""
+                  );
+
+                  if (!Number.isFinite(bet)) {
+                    continue;
+                  }
+
+                  const root = amountNode.closest(".players-row")
+                    || findParticipantRowRoot(amountNode);
+                  const rootRect = root.getBoundingClientRect();
+                  const amountRect = amountNode.getBoundingClientRect();
+                  const key = [
+                    Math.round(rootRect.top),
+                    Math.round(rootRect.left),
+                    Math.round(amountRect.top),
+                    Math.round(amountRect.left),
+                    bet,
+                  ].join(":");
+
+                  if (seen.has(key)) {
+                    continue;
+                  }
+
+                  seen.add(key);
+
+                  const cashout = firstParsedFromSelectors(
+                    root,
+                    [
+                      ".players-row-win-odd",
+                      ".players-row-coefficient",
+                      ".players-row-multiplier",
+                      ".players-row-cashout",
+                      "[class*='win-odd']",
+                      "[class*='coefficient']",
+                      "[class*='multiplier']",
+                      "[class*='cashout']",
+                    ],
+                    parseMultiplier
+                  );
+                  const classWin = firstParsedFromSelectors(
+                    root,
+                    [
+                      ".players-row-win-amount",
+                      ".players-row-win",
+                      ".players-row-winning",
+                      ".players-row-payout",
+                      ".players-row-profit",
+                      "[class*='win-amount']",
+                      "[class*='winning']",
+                      "[class*='payout']",
+                      "[class*='profit']",
+                    ],
+                    parseCompactNumber
+                  );
+                  const rowItems = visibleCellItems(root);
+                  const fallbackCashouts = rowItems
+                    .map((item) => ({
+                      value: parseMultiplier(item.text),
+                      x: item.x,
+                    }))
+                    .filter((item) => Number.isFinite(item.value))
+                    .sort((left, right) => left.x - right.x);
+                  const fallbackWins = rowItems
+                    .filter((item) => (
+                      item.node !== amountNode
+                      && !item.node.contains(amountNode)
+                      && !amountNode.contains(item.node)
+                      && item.x > amountRect.left + amountRect.width / 2
+                    ))
+                    .map((item) => ({
+                      value: parseCompactNumber(item.text),
+                      x: item.x,
+                    }))
+                    .filter((item) => Number.isFinite(item.value))
+                    .sort((left, right) => left.x - right.x);
+                  const resolvedCashout = Number.isFinite(cashout)
+                    ? cashout
+                    : (
+                      fallbackCashouts.length
+                        ? fallbackCashouts[0].value
+                        : null
+                    );
+                  const resolvedWin = Number.isFinite(resolvedCashout)
+                    ? (
+                      Number.isFinite(classWin)
+                        ? classWin
+                        : (
+                          fallbackWins.length
+                            ? fallbackWins[fallbackWins.length - 1].value
+                            : null
+                        )
+                    )
+                    : null;
+
+                  rows.push({
+                    bet,
+                    win: resolvedWin,
+                    cashout: resolvedCashout,
+                  });
+                }
+
+                return rows;
+              };
+
+              const classBasedSummary = summarizeRows(
+                readClassBasedParticipantRows()
+              );
+
+              if (classBasedSummary) {
+                return classBasedSummary;
+              }
+
+              const nodes = Array.from(document.querySelectorAll("body *"));
+              const visibleTextNodes = [];
+
+              for (const node of nodes) {
+                if (!isVisible(node)) {
+                  continue;
+                }
+
+                const text = clean(node.innerText || node.textContent || "");
+
+                if (!text || text.length > 80) {
+                  continue;
+                }
+
+                const rect = node.getBoundingClientRect();
+
+                visibleTextNodes.push({
+                  text,
+                  x: rect.left,
+                  y: rect.top + rect.height / 2,
+                  top: rect.top,
+                  height: rect.height,
+                });
+              }
+
+              const placeBetY = visibleTextNodes
+                .filter((item) => /PLACE BET/i.test(item.text))
+                .map((item) => item.top)
+                .sort((left, right) => left - right)[0] || window.innerHeight;
+
+              const tableItems = visibleTextNodes
+                .filter((item) => item.top < placeBetY - 8)
+                .filter((item) => (
+                  parseCompactNumber(item.text) !== null
+                  || parseMultiplier(item.text) !== null
+                  || item.text === "-"
+                ));
+
+              const rowMap = new Map();
+
+              for (const item of tableItems) {
+                const rowKey = String(Math.round(item.y / 28) * 28);
+                const row = rowMap.get(rowKey) || [];
+                row.push(item);
+                rowMap.set(rowKey, row);
+              }
+
+              const rows = [];
+
+              for (const row of rowMap.values()) {
+                const ordered = row
+                  .slice()
+                  .sort((left, right) => left.x - right.x);
+                const moneyValues = [];
+                const multipliers = [];
+
+                for (const item of ordered) {
+                  const money = parseCompactNumber(item.text);
+                  const multiplier = parseMultiplier(item.text);
+
+                  if (money !== null) {
+                    moneyValues.push(money);
+                  }
+
+                  if (multiplier !== null) {
+                    multipliers.push(multiplier);
+                  }
+                }
+
+                if (!moneyValues.length) {
+                  continue;
+                }
+
+                // Exclude quick-bet preset rows such as 500 / 2K / 5K / 20K.
+                if (moneyValues.length >= 4 && !multipliers.length) {
+                  continue;
+                }
+
+                const cashout = multipliers.length ? multipliers[0] : null;
+
+                rows.push({
+                  bet: moneyValues[0],
+                  win: cashout !== null && moneyValues.length > 1
+                    ? moneyValues[moneyValues.length - 1]
+                    : null,
+                  cashout,
+                });
+              }
+
+              return summarizeRows(rows);
+            }
+            """
+        )
+    except Exception:
+        return None
+
+
+async def read_multipliers_reliably(
+    page,
+    selectors,
+    attempts=4,
+    delay_seconds=0.25
+):
+
+    for attempt in range(attempts):
+
+        values = await read_multipliers(
+            page,
+            selectors
+        )
+
+        if values:
+            return values
+
+        if attempt < attempts - 1:
+
+            await asyncio.sleep(
+                delay_seconds
+            )
+
+    return []
+
+
+async def install_history_watcher(
+    page,
+    selectors,
+    initial_snapshot
+):
+    selector_list = normalize_selector_config(
+        selectors
+    )
+
+    await page.evaluate(
+        """
+        ({ selectors, initialSnapshot, intervalMs, maxNewValues }) => {
+          const idAttributes = [
+            "data-round-id",
+            "data-game-id",
+            "data-id",
+            "data-round",
+            "data-history-id",
+            "data-bet-round-id",
+            "id",
+          ];
+
+          const extractRoundId = (node) => {
+            let current = node;
+
+            for (let depth = 0; current && depth < 4; depth += 1) {
+              for (const attribute of idAttributes) {
+                const value = current.getAttribute(attribute);
+
+                if (value && /\\d/.test(value)) {
+                  return value;
+                }
+              }
+
+              current = current.parentElement;
+            }
+
+            return null;
+          };
+
+            const readValues = () => {
+            const values = [];
+            const seen = new Set();
+
+            for (const selector of selectors) {
+              const nodes = Array.from(document.querySelectorAll(selector));
+
+              for (const node of nodes) {
+                const rect = node.getBoundingClientRect();
+                const style = window.getComputedStyle(node);
+
+                if (
+                  rect.width <= 0
+                  || rect.height <= 0
+                  || style.visibility === "hidden"
+                  || style.display === "none"
+                ) {
+                  continue;
+                }
+
+                const text = (node.innerText || node.textContent || "").trim();
+                const match = text.match(/^(\\d+(?:\\.\\d+)?)(?:x)?$/i);
+
+                if (!match) {
+                  continue;
+                }
+
+                const value = Number.parseFloat(match[1]);
+
+                if (!Number.isFinite(value) || value < 1) {
+                  continue;
+                }
+
+                const rounded = Math.round(value * 100) / 100;
+                const key = `${seen.size}:${rounded}`;
+                seen.add(key);
+                values.push({
+                  value: rounded,
+                  roundId: extractRoundId(node),
+                });
+              }
+
+              if (values.length) {
+                return values;
+              }
+            }
+
+            return [];
+          };
+
+          const findNewValues = (oldSnapshot, newSnapshot) => {
+            if (!oldSnapshot.length || !newSnapshot.length) {
+              return [];
+            }
+
+            const maxShift = Math.min(newSnapshot.length, 200);
+            const anchors = [80, 50, 30, 20, 12, 8, 5, 3];
+            const snapshotValue = (item) => (
+              typeof item === "number" ? item : item.value
+            );
+
+            for (const anchorLength of anchors) {
+              if (oldSnapshot.length < anchorLength) {
+                continue;
+              }
+
+              const oldAnchor = oldSnapshot.slice(0, anchorLength);
+
+              for (let shift = 1; shift <= maxShift; shift += 1) {
+                if (shift + anchorLength > newSnapshot.length) {
+                  break;
+                }
+
+                const newAnchor = newSnapshot.slice(shift, shift + anchorLength);
+
+                if (
+                  oldAnchor.every(
+                    (item, index) => snapshotValue(item) === snapshotValue(newAnchor[index])
+                  )
+                ) {
+                  return newSnapshot.slice(0, shift);
+                }
+              }
+            }
+
+            return [];
+          };
+
+          if (window.__aviatorMonitorWatcher?.timer) {
+            clearInterval(window.__aviatorMonitorWatcher.timer);
+          }
+
+          if (window.__aviatorMonitorWatcher?.observer) {
+            window.__aviatorMonitorWatcher.observer.disconnect();
+          }
+
+          window.__aviatorMonitorWatcher = {
+            queue: [],
+            snapshot: Array.isArray(initialSnapshot)
+              ? initialSnapshot.map((value) => (
+                  typeof value === "number" ? { value, roundId: null } : value
+                ))
+              : [],
+            lastVisibleAt: Date.now(),
+            reads: 0,
+            misses: 0,
+            timer: null,
+            observer: null,
+            pendingMutationTick: false,
+          };
+
+          const tick = () => {
+            const state = window.__aviatorMonitorWatcher;
+            const detectedAt = Date.now();
+            const current = readValues();
+            state.reads += 1;
+
+            if (!current.length) {
+              state.misses += 1;
+              return;
+            }
+
+            state.lastVisibleAt = Date.now();
+
+            if (!state.snapshot.length) {
+              state.snapshot = current;
+              return;
+            }
+
+            const newValues = findNewValues(state.snapshot, current);
+
+            if (newValues.length && newValues.length <= maxNewValues) {
+              state.queue.push(
+                ...newValues
+                  .slice()
+                  .reverse()
+                  .map((item) => ({
+                    value: typeof item === "number" ? item : item.value,
+                    roundId: typeof item === "number" ? null : item.roundId,
+                    detectedAt,
+                  }))
+              );
+            }
+
+            state.snapshot = current;
+          };
+
+          const scheduleImmediateTick = () => {
+            const state = window.__aviatorMonitorWatcher;
+
+            if (!state || state.pendingMutationTick) {
+              return;
+            }
+
+            state.pendingMutationTick = true;
+
+            window.setTimeout(() => {
+              const latestState = window.__aviatorMonitorWatcher;
+
+              if (!latestState) {
+                return;
+              }
+
+              latestState.pendingMutationTick = false;
+              tick();
+            }, 10);
+          };
+
+          window.__aviatorMonitorWatcher.observer = new MutationObserver(
+            scheduleImmediateTick
+          );
+
+          window.__aviatorMonitorWatcher.observer.observe(
+            document.body,
+            {
+              childList: true,
+              subtree: true,
+              characterData: true,
+            }
+          );
+
+          tick();
+          window.__aviatorMonitorWatcher.timer = setInterval(tick, intervalMs);
+        }
+        """,
+        {
+            "selectors": selector_list,
+            "initialSnapshot": initial_snapshot,
+            "intervalMs": PAGE_WATCHER_INTERVAL_MS,
+            "maxNewValues": MAX_NEW_VALUES_PER_SCAN,
+        }
+    )
+
+    log(
+        f"Installed page watcher at {PAGE_WATCHER_INTERVAL_MS}ms."
+    )
+
+
+async def drain_history_watcher(page):
+    try:
+        return await page.evaluate(
+            """
+            () => {
+              const state = window.__aviatorMonitorWatcher;
+
+              if (!state) {
+                return null;
+              }
+
+              const queue = state.queue.slice();
+              state.queue = [];
+
+              return {
+                queue,
+                snapshot: (state.snapshot || []).map((item) => (
+                  typeof item === "number" ? item : item.value
+                )),
+                reads: state.reads || 0,
+                misses: state.misses || 0,
+                lastVisibleAt: state.lastVisibleAt || null,
+              };
+            }
+            """
+        )
+    except Exception:
+        return None
+
+
+def extract_round_ids(value):
+    round_ids = []
+
+    if isinstance(value, dict):
+
+        for key, child in value.items():
+
+            if (
+                normalize_payload_key(
+                    key
+                ) in ROUND_ID_KEYS
+                and isinstance(
+                    child,
+                    (
+                        str,
+                        int
+                    )
+                )
+            ):
+
+                round_ids.append(
+                    str(child)
+                )
+
+            round_ids.extend(
+                extract_round_ids(
+                    child
+                )
+            )
+
+    elif isinstance(value, list):
+
+        for child in value:
+
+            round_ids.extend(
+                extract_round_ids(
+                    child
+                )
+            )
+
+    return round_ids
+
+
+def payload_text_may_have_round_context(text):
+    lowered = text.lower()
+
+    return (
+        any(
+            marker in lowered
+            for marker in CONTEXT_RESPONSE_MARKERS
+        )
+        or "roundid" in lowered
+    )
+
+
+def decode_frame_payload(payload):
+    if payload is None:
+        return ""
+
+    if isinstance(payload, bytes):
+        try:
+            return payload.decode(
+                "utf-8",
+                errors="ignore"
+            )
+        except Exception:
+            return ""
+
+    return str(
+        payload
+    )
+
+
+def json_payloads_from_text(text):
+    payloads = []
+    decoder = json.JSONDecoder()
+
+    for chunk in str(
+        text
+    ).split(
+        "\x1e"
+    ):
+        stripped = chunk.strip()
+
+        if not stripped:
+            continue
+
+        starts = [
+            index
+            for index in (
+                stripped.find("{"),
+                stripped.find("["),
+            )
+            if index >= 0
+        ]
+
+        for start in sorted(
+            starts
+        ):
+            try:
+                payload, _ = decoder.raw_decode(
+                    stripped[start:]
+                )
+            except json.JSONDecodeError:
+                continue
+
+            payloads.append(
+                payload
+            )
+            break
+
+    return payloads
+
+
+def response_may_have_round_context(response_url):
+    lowered = response_url.lower()
+
+    return any(
+        marker in lowered
+        for marker in CONTEXT_RESPONSE_MARKERS
+    )
+
+
+def response_source_label(response_url):
+    parsed = urlparse(
+        response_url
+    )
+    path_parts = [
+        part
+        for part in parsed.path.split(
+            "/"
+        )
+        if part
+    ]
+
+    if path_parts:
+        return path_parts[-1][:80]
+
+    return (
+        parsed.netloc
+        or "network"
+    )[:80]
+
+
+def process_context_payload(
+    payload,
+    source_label,
+    game_source,
+    observed_round_ids,
+    observed_context_hashes,
+    collect_round_context=True
+):
+    new_count = 0
+
+    for round_id in extract_round_ids(
+        payload
+    ):
+
+        if round_id in observed_round_ids:
+            continue
+
+        observed_round_ids.add(
+            round_id
+        )
+
+        append_observed_round_id(
+            round_id,
+            source_label
+        )
+
+        new_count += 1
+
+    if new_count:
+        log(
+            f"Observed {new_count} new game round IDs from {source_label}."
+        )
+
+    context_count = 0
+
+    if collect_round_context:
+        summaries = summarize_round_context(
+            payload
+        )
+
+        context_count = append_round_context_summaries(
+            summaries,
+            source_label,
+            game_source,
+            observed_context_hashes
+        )
+
+        if context_count:
+            log(
+                "Captured "
+                f"{context_count} round context aggregate rows from {source_label}."
+            )
+
+    return new_count, context_count
+
+
+async def install_round_id_observer(page, collect_round_context=True):
+    observed_round_ids = load_observed_round_ids()
+    observed_context_hashes = load_observed_context_hashes()
+    websocket_urls = {}
+
+    async def handle_response(response):
+        response_url = response.url
+        source_label = response_source_label(
+            response_url
+        )
+
+        if not response_may_have_round_context(
+            response_url
+        ):
+            return
+
+        try:
+            payload = await response.json()
+        except Exception:
+            return
+
+        process_context_payload(
+            payload,
+            source_label,
+            page_source(
+                page.url
+            ),
+            observed_round_ids,
+            observed_context_hashes,
+            collect_round_context
+        )
+
+    def handle_websocket_frame(event):
+        payload_text = decode_frame_payload(
+            event.get(
+                "response",
+                {}
+            ).get(
+                "payloadData",
+                ""
+            )
+        )
+
+        if not payload_text_may_have_round_context(
+            payload_text
+        ):
+            return
+
+        request_id = event.get(
+            "requestId",
+            ""
+        )
+        websocket_url = websocket_urls.get(
+            request_id,
+            ""
+        )
+        source_label = "websocket"
+
+        if websocket_url:
+            source_label = "ws:" + response_source_label(
+                websocket_url
+            )
+
+        for payload in json_payloads_from_text(
+            payload_text
+        ):
+            process_context_payload(
+                payload,
+                source_label,
+                page_source(
+                    page.url
+                ),
+                observed_round_ids,
+                observed_context_hashes,
+                collect_round_context
+            )
+
+    page.on(
+        "response",
+        lambda response: asyncio.create_task(
+            handle_response(
+                response
+            )
+        )
+    )
+
+    try:
+        cdp_session = await page.context.new_cdp_session(
+            page
+        )
+
+        await cdp_session.send(
+            "Network.enable"
+        )
+
+        cdp_session.on(
+            "Network.webSocketCreated",
+            lambda event: websocket_urls.update(
+                {
+                    event.get(
+                        "requestId",
+                        ""
+                    ): event.get(
+                        "url",
+                        ""
+                    )
+                }
+            )
+        )
+        cdp_session.on(
+            "Network.webSocketFrameReceived",
+            handle_websocket_frame
+        )
+        setattr(
+            page,
+            "_aviator_context_cdp_session",
+            cdp_session
+        )
+
+        log(
+            "Installed WebSocket context observer through Chrome DevTools."
+        )
+
+    except Exception as exc:
+        log(
+            f"WARNING: Could not install WebSocket context observer: {exc}"
+        )
+
+    log(
+        "Installed game round ID/context observer for bet and round responses."
+    )
+
+
+async def read_visible_provably_fair_seed(page):
+    try:
+        return await page.evaluate(
+            """
+            () => {
+              const text = document.body.innerText || "";
+
+              if (!/PROVABLY FAIR/i.test(text)) {
+                return null;
+              }
+
+              const values = Array.from(
+                document.querySelectorAll("input, textarea")
+              )
+                .map((node) => String(node.value || "").trim())
+                .filter((value) => /^[a-f0-9]{12,128}$/i.test(value));
+
+              if (values.length < 2) {
+                return null;
+              }
+
+              values.sort((left, right) => left.length - right.length);
+
+              return {
+                nextSeed: values[0] || "",
+                serverNextHash: values[values.length - 1] || "",
+              };
+            }
+            """
+        )
+    except Exception:
+        return None
+
+
+# =========================================================
+# FIND NEW ROUNDS
+# =========================================================
+
+def find_new_values(old_snapshot, new_snapshot):
+    """
+    Assumes page history is newest -> oldest.
+
+    Example:
+
+    OLD:
+    [3.20, 1.50, 8.10, 2.00]
+
+    NEW:
+    [4.30, 3.20, 1.50, 8.10]
+
+    Returns:
+    [4.30]
+
+    This is more reliable than simply testing
+    whether newest != last_seen.
+    """
+
+    if not old_snapshot:
+
+        return []
+
+    if not new_snapshot:
+
+        return []
+
+    # Try to determine how many values were inserted
+    # at the beginning of the history list.
+    #
+    # The page can occasionally revise or lazy-load older history entries.
+    # Because of that, requiring the entire overlapping tail to match is too
+    # strict and can miss valid new rounds. Anchor on the newest stable prefix
+    # of the previous snapshot instead.
+
+    max_shift = min(
+        len(new_snapshot),
+        200
+    )
+
+    anchor_lengths = [
+        80,
+        50,
+        30,
+        20,
+        12,
+        8,
+        5,
+        3
+    ]
+
+    for anchor_length in anchor_lengths:
+
+        if len(old_snapshot) < anchor_length:
+            continue
+
+        old_anchor = old_snapshot[
+            :anchor_length
+        ]
+
+        for shift in range(
+            1,
+            max_shift + 1
+        ):
+
+            if shift + anchor_length > len(new_snapshot):
+                break
+
+            new_anchor = new_snapshot[
+                shift:shift + anchor_length
+            ]
+
+            if old_anchor == new_anchor:
+
+                return new_snapshot[:shift]
+
+    # No shift found.
+    #
+    # This can happen after:
+    # - refresh
+    # - connection loss
+    # - selector/order changes
+    #
+    # Don't blindly import everything.
+    return []
+
+
+# =========================================================
+# SELECT AVIATRIX TAB
+# =========================================================
+
+def page_matches_preferred_url(page_url, preferred_url):
+    if not preferred_url:
+        return False
+
+    try:
+        preferred = urlparse(
+            preferred_url
+        )
+        current = urlparse(
+            page_url
+        )
+    except ValueError:
+        return False
+
+    if not preferred.netloc:
+        return False
+
+    return current.netloc.lower().endswith(
+        preferred.netloc.lower()
+    )
+
+
+def page_is_real_aviatrix(page_url):
+    lowered = page_url.lower()
+
+    return (
+        "game.aviatrix.bet" in lowered
+        and "isdemo=false" in lowered
+    )
+
+
+def page_source(page_url):
+    lowered = page_url.lower()
+
+    if "isdemo=false" in lowered:
+        return "real"
+
+    if "isdemo=true" in lowered or "demo.aviatrix.bet" in lowered:
+        return "demo"
+
+    return "unknown"
+
+
+async def find_aviatrix_page(browser, preferred_url=None, required_source=None):
+
+    if not browser.contexts:
+        return None
+
+    pages = [
+        page
+        for context in browser.contexts
+        for page in context.pages
+    ]
+
+    if not pages:
+        return None
+
+    # Prefer the configured real game page so an open demo tab does not win.
+
+    for page in pages:
+
+        try:
+
+            if page_matches_preferred_url(
+                page.url,
+                preferred_url
+            ):
+                if required_source and page_source(page.url) != required_source:
+                    continue
+
+                return page
+
+        except Exception:
+
+            continue
+
+    # Prefer a logged-in real Aviatrix game tab over demo.
+
+    for page in pages:
+
+        try:
+
+            if page_is_real_aviatrix(
+                page.url
+            ):
+                if required_source and page_source(page.url) != required_source:
+                    continue
+
+                return page
+
+        except Exception:
+
+            continue
+
+    # Fall back to the Aviatrix game tab.
+
+    for page in pages:
+
+        try:
+
+            url = page.url.lower()
+
+            title = (
+                await page.title()
+            ).lower()
+
+            if (
+                "aviatrix" in title
+                or
+                "game.aviatrix.bet" in url
+            ):
+                if required_source and page_source(page.url) != required_source:
+                    continue
+
+                return page
+
+        except Exception:
+
+            continue
+
+    return None
+
+
+# =========================================================
+# CONNECT
+# =========================================================
+
+async def connect_to_chrome(playwright):
+
+    browser = await playwright.chromium.connect_over_cdp(
+        "http://127.0.0.1:9222"
+    )
+
+    return browser
+
+
+# =========================================================
+# INITIAL HISTORY
+# =========================================================
+
+async def initialize_history(
+    page,
+    selector,
+    source
+):
+
+    state = load_state()
+
+    saved_snapshot = state.get(
+        "snapshot",
+        []
+    )
+
+    current = await read_multipliers_reliably(
+        page,
+        selector
+    )
+
+    if not current:
+
+        if saved_snapshot:
+
+            log(
+                "No visible multipliers found during startup; using saved snapshot until history returns."
+            )
+
+            return saved_snapshot
+
+        log(
+            "No visible multipliers found during startup."
+        )
+
+        return []
+
+    log(
+        f"Found {len(current)} visible multipliers."
+    )
+
+    # First-ever run:
+    #
+    # Save currently visible history oldest -> newest.
+
+    if not saved_snapshot:
+
+        log(
+            "No previous collector state found."
+        )
+
+        log(
+            "Saving initial visible history."
+        )
+
+        for multiplier in reversed(
+            current
+        ):
+
+            append_round(
+                multiplier,
+                source=source
+            )
+
+        log(
+            f"Saved {len(current)} initial multipliers."
+        )
+
+    else:
+
+        # Collector was previously running.
+        # Try to determine whether any rounds happened
+        # between shutdown and restart.
+
+        new_values = find_new_values(
+            saved_snapshot,
+            current
+        )
+
+        if new_values:
+
+            if len(new_values) > MAX_STARTUP_RECOVERY_VALUES:
+
+                log(
+                    "WARNING: Startup recovery found "
+                    f"{len(new_values)} possible new rounds, which is above "
+                    f"the safe limit of {MAX_STARTUP_RECOVERY_VALUES}. "
+                    "Resetting snapshot without appending old history."
+                )
+
+            else:
+
+                log(
+                    f"Detected {len(new_values)} rounds since previous snapshot."
+                )
+
+                for multiplier in reversed(
+                    new_values
+                ):
+
+                    append_round(
+                        multiplier,
+                        source=source
+                    )
+
+        else:
+
+            log(
+                "Existing collector state loaded."
+            )
+
+    save_state(
+        current
+    )
+
+    return current
+
+
+# =========================================================
+# MONITOR
+# =========================================================
+
+async def monitor_page(
+    page,
+    selector,
+    poll_seconds,
+    heartbeat_seconds,
+    snapshot_scan_seconds,
+    minimum_new_round_gap_seconds,
+    required_source=None,
+    collect_round_context=True,
+    participant_count_selector=DEFAULT_PARTICIPANT_COUNT_SELECTOR
+):
+
+    current_source = page_source(
+        page.url
+    )
+
+    if required_source and current_source != required_source:
+
+        raise RuntimeError(
+            "Required round source is "
+            f"{required_source}, but current page source is {current_source}."
+        )
+
+    previous_snapshot = await initialize_history(
+        page,
+        selector,
+        current_source
+    )
+
+    log(
+        f"Round source: {current_source}"
+    )
+
+    await install_round_id_observer(
+        page,
+        collect_round_context
+    )
+
+    await install_history_watcher(
+        page,
+        selector,
+        previous_snapshot
+    )
+
+    last_heartbeat = time.time()
+
+    last_no_visible_log = 0
+
+    no_overlap_count = 0
+
+    last_snapshot_scan = 0
+
+    last_seed_scan = 0
+
+    last_participant_scan = 0
+
+    last_participant_count = None
+
+    last_participant_write_at = 0
+
+    last_participant_log_at = 0
+
+    last_participant_table_scan = 0
+
+    last_participant_table_signature = None
+
+    last_participant_table_write_at = 0
+
+    observed_seed_pairs = load_observed_seed_pairs()
+
+    last_appended_multiplier = None
+
+    last_appended_at = 0
+
+    fast_poll_seconds = min(
+        poll_seconds,
+        max(
+            PAGE_WATCHER_INTERVAL_MS / 1000,
+            0.05
+        )
+    )
+
+    log(
+        "Live monitoring started "
+        f"(watcher drain every {fast_poll_seconds:.2f}s, "
+        f"snapshot scan every {snapshot_scan_seconds:.2f}s)."
+    )
+
+    def append_live_round(multiplier, timestamp=None, round_id=None):
+        nonlocal last_appended_multiplier
+        nonlocal last_appended_at
+
+        current_time = time.monotonic()
+
+        if (
+            last_appended_multiplier == multiplier
+            and current_time - last_appended_at < minimum_new_round_gap_seconds
+        ):
+            log(
+                f"Skipped duplicate live round: {multiplier:.2f}x"
+            )
+            return
+
+        append_round(
+            multiplier,
+            timestamp,
+            round_id,
+            current_source
+        )
+
+        last_appended_multiplier = multiplier
+        last_appended_at = current_time
+
+        log(
+            f"NEW ROUND: {multiplier:.2f}x"
+        )
+
+    while True:
+
+        try:
+
+            live_source = page_source(
+                page.url
+            )
+
+            if required_source and live_source != required_source:
+
+                log(
+                    "WARNING: Required round source changed from "
+                    f"{required_source} to {live_source}. Reconnecting without writing."
+                )
+
+                raise RuntimeError(
+                    "Required round source changed."
+                )
+
+            current_source = live_source
+
+            if (
+                collect_round_context
+                and time.time() - last_participant_scan >= PARTICIPANT_SCAN_SECONDS
+            ):
+                participant_count = await read_participant_count(
+                    page,
+                    participant_count_selector
+                )
+                last_participant_scan = time.time()
+
+                if participant_count is not None:
+                    current_time = time.monotonic()
+                    count_changed = participant_count != last_participant_count
+                    minimum_write_gap_passed = (
+                        current_time - last_participant_write_at >= PARTICIPANT_MIN_WRITE_SECONDS
+                    )
+                    heartbeat_due = (
+                        current_time - last_participant_write_at >= PARTICIPANT_HEARTBEAT_SECONDS
+                    )
+                    should_write_participant_context = (
+                        (
+                            count_changed
+                            and minimum_write_gap_passed
+                        )
+                        or heartbeat_due
+                    )
+
+                    if should_write_participant_context:
+                        append_participant_count_context(
+                            participant_count,
+                            current_source
+                        )
+                        last_participant_write_at = current_time
+
+                        if (
+                            count_changed
+                            and current_time - last_participant_log_at >= 10
+                        ):
+                            log(
+                                "Captured live participant count from flight radar: "
+                                f"{participant_count}"
+                            )
+                            last_participant_log_at = current_time
+
+                        last_participant_count = participant_count
+
+            if (
+                collect_round_context
+                and time.time() - last_participant_table_scan >= PARTICIPANT_TABLE_SCAN_SECONDS
+            ):
+                table_context = await read_visible_participants_table(
+                    page
+                )
+                last_participant_table_scan = time.time()
+
+                if table_context:
+                    current_time = time.monotonic()
+                    table_signature = visible_participants_signature(
+                        table_context,
+                        current_source
+                    )
+                    table_changed = table_signature != last_participant_table_signature
+                    table_heartbeat_due = (
+                        current_time - last_participant_table_write_at
+                        >= PARTICIPANT_TABLE_HEARTBEAT_SECONDS
+                    )
+
+                    if table_changed or table_heartbeat_due:
+                        append_visible_participants_context(
+                            table_context,
+                            current_source
+                        )
+                        last_participant_table_signature = table_signature
+                        last_participant_table_write_at = current_time
+
+                        if table_changed:
+                            log(
+                                "Captured visible participants table aggregate: "
+                                f"{int(table_context.get('visible_rows', 0))} rows, "
+                                f"{context_number(table_context.get('total_bet')) or 'unknown'} total bet."
+                            )
+
+            watcher_state = await drain_history_watcher(
+                page
+            )
+
+            if watcher_state and watcher_state.get("queue"):
+
+                queued_events = watcher_state.get(
+                    "queue",
+                    []
+                )
+
+                if len(queued_events) > MAX_NEW_VALUES_PER_SCAN:
+
+                    log(
+                        "WARNING: Page watcher found "
+                        f"{len(queued_events)} possible rounds, above safe limit. "
+                        "Dropping queued batch and resetting snapshot."
+                    )
+
+                else:
+
+                    for event in queued_events:
+
+                        if isinstance(event, dict):
+                            multiplier = float(
+                                event.get(
+                                    "value"
+                                )
+                            )
+                            round_id = event.get(
+                                "roundId"
+                            )
+                            detected_at = timestamp_from_millis(
+                                event.get(
+                                    "detectedAt"
+                                )
+                            )
+                        else:
+                            multiplier = float(
+                                event
+                            )
+                            round_id = None
+                            detected_at = now_string()
+
+                        append_live_round(
+                            multiplier,
+                            detected_at,
+                            round_id
+                        )
+
+                previous_snapshot = watcher_state.get(
+                    "snapshot",
+                    previous_snapshot
+                )
+
+                save_state(
+                    previous_snapshot
+                )
+
+                no_overlap_count = 0
+
+            did_snapshot_scan = False
+            current_snapshot = []
+
+            if time.time() - last_snapshot_scan >= snapshot_scan_seconds:
+
+                did_snapshot_scan = True
+
+                current_snapshot = await read_multipliers(
+                    page,
+                    selector
+                )
+
+                last_snapshot_scan = time.time()
+
+            if time.time() - last_seed_scan >= 5:
+
+                seed_data = await read_visible_provably_fair_seed(
+                    page
+                )
+
+                last_seed_scan = time.time()
+
+                if seed_data:
+
+                    next_seed = seed_data.get(
+                        "nextSeed",
+                        ""
+                    )
+                    server_next_hash = seed_data.get(
+                        "serverNextHash",
+                        ""
+                    )
+                    seed_pair = (
+                        next_seed,
+                        server_next_hash
+                    )
+
+                    if seed_pair not in observed_seed_pairs:
+
+                        observed_seed_pairs.add(
+                            seed_pair
+                        )
+
+                        append_provably_fair_seed(
+                            next_seed,
+                            server_next_hash,
+                            "visible_provably_fair"
+                        )
+
+                        log(
+                            "Captured visible provably fair seed/hash."
+                        )
+
+            if current_snapshot:
+
+                if previous_snapshot:
+
+                    new_values = find_new_values(
+                        previous_snapshot,
+                        current_snapshot
+                    )
+
+                    if new_values:
+
+                        if len(new_values) > MAX_NEW_VALUES_PER_SCAN:
+
+                            log(
+                                "WARNING: Found "
+                                f"{len(new_values)} possible new rounds in one scan, "
+                                f"above safe limit of {MAX_NEW_VALUES_PER_SCAN}. "
+                                "Resetting snapshot without appending old history."
+                            )
+
+                        else:
+
+                            # new_values are newest -> older.
+                            #
+                            # Write chronological order.
+
+                            for multiplier in reversed(
+                                new_values
+                            ):
+
+                                append_live_round(
+                                    multiplier
+                                )
+
+                        no_overlap_count = 0
+
+                    elif current_snapshot != previous_snapshot:
+
+                        no_overlap_count += 1
+
+                        log(
+                            "WARNING: Snapshot changed but no reliable overlap was found "
+                            f"({no_overlap_count}/3)."
+                        )
+
+                        if no_overlap_count < 3:
+
+                            await asyncio.sleep(
+                                fast_poll_seconds
+                            )
+
+                            continue
+
+                        log(
+                            "Resetting snapshot to current visible history so live tracking can continue."
+                        )
+
+                        no_overlap_count = 0
+
+                    else:
+
+                        no_overlap_count = 0
+
+                previous_snapshot = current_snapshot
+
+                save_state(
+                    current_snapshot
+                )
+
+            elif did_snapshot_scan:
+
+                if time.time() - last_no_visible_log >= 5:
+
+                    log(
+                        "WARNING: No multipliers currently visible."
+                    )
+
+                    last_no_visible_log = time.time()
+
+            # Heartbeat
+
+            if (
+                time.time()
+                - last_heartbeat
+                >= heartbeat_seconds
+            ):
+
+                log(
+                    "Collector heartbeat: running normally."
+                )
+
+                last_heartbeat = time.time()
+
+            await asyncio.sleep(
+                fast_poll_seconds
+            )
+
+        except Exception as exc:
+
+            log(
+                f"Page read error: {exc}"
+            )
+
+            raise
+
+
+# =========================================================
+# MAIN
+# =========================================================
+
+async def main():
+
+    cfg = load_config()
+
+    ensure_files()
+
+    lock_file = acquire_collector_lock()
+
+    # Keep the lock file handle alive for the whole collector process.
+    _ = lock_file
+
+    backup_rounds_csv()
+
+    selector = cfg.get(
+        "history_selectors",
+        cfg.get(
+            "history_selector",
+            ".text-w-60"
+        )
+    )
+
+    poll_seconds = float(
+        cfg.get(
+            "poll_seconds",
+            1.0
+        )
+    )
+
+    heartbeat_seconds = float(
+        cfg.get(
+            "heartbeat_seconds",
+            60
+        )
+    )
+
+    snapshot_scan_seconds = float(
+        cfg.get(
+            "snapshot_scan_seconds",
+            DEFAULT_SNAPSHOT_SCAN_SECONDS
+        )
+    )
+
+    reconnect_seconds = float(
+        cfg.get(
+            "reconnect_seconds",
+            5
+        )
+    )
+
+    minimum_new_round_gap_seconds = float(
+        cfg.get(
+            "minimum_new_round_gap_seconds",
+            1.5
+        )
+    )
+    required_source = str(
+        cfg.get(
+            "require_source",
+            ""
+        )
+    ).strip().lower() or None
+
+    collect_round_context = bool(
+        cfg.get(
+            "collect_round_context",
+            True
+        )
+    )
+
+    participant_count_selector = cfg.get(
+        "participant_count_selector",
+        DEFAULT_PARTICIPANT_COUNT_SELECTOR
+    )
+
+    log(
+        "=================================="
+    )
+
+    log(
+        "Aviatrix collector starting"
+    )
+
+    log(
+        f"Selector: {selector}"
+    )
+
+    log(
+        "Round context aggregates: "
+        f"{'enabled' if collect_round_context else 'disabled'}"
+    )
+
+    log(
+        f"Participant count selector: {participant_count_selector}"
+    )
+
+    async with async_playwright() as p:
+
+        while True:
+
+            browser = None
+
+            try:
+
+                log(
+                    "Connecting to Chrome..."
+                )
+
+                browser = await connect_to_chrome(
+                    p
+                )
+
+                log(
+                    "Connected to Chrome."
+                )
+
+                page = await find_aviatrix_page(
+                    browser,
+                    cfg.get(
+                        "game_url"
+                    ),
+                    required_source
+                )
+
+                if page is None:
+
+                    log(
+                        "Required Aviatrix tab not found."
+                    )
+
+                    log(
+                        "Open the main real Aviatrix game tab "
+                        "(game.aviatrix.bet with isDemo=false) in the debug Chrome window."
+                    )
+
+                    await asyncio.sleep(
+                        reconnect_seconds
+                    )
+
+                    continue
+
+                title = await page.title()
+
+                log(
+                    f"Using page: {title}"
+                )
+
+                log(
+                    f"URL: {page.url}"
+                )
+
+                await monitor_page(
+                    page,
+                    selector,
+                    poll_seconds,
+                    heartbeat_seconds,
+                    snapshot_scan_seconds,
+                    minimum_new_round_gap_seconds,
+                    required_source,
+                    collect_round_context,
+                    participant_count_selector
+                )
+
+            except KeyboardInterrupt:
+
+                log(
+                    "Collector stopped by user."
+                )
+
+                return
+
+            except Exception as exc:
+
+                log(
+                    f"Collector error: {exc}"
+                )
+
+                log(
+                    f"Retrying in {reconnect_seconds} seconds..."
+                )
+
+                await asyncio.sleep(
+                    reconnect_seconds
+                )
+
+
+if __name__ == "__main__":
+    try:
+
+        asyncio.run(
+            main()
+        )
+
+    except KeyboardInterrupt:
+
+        print(
+            "\nCollector stopped."
+        )

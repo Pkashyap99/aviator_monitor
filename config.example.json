@@ -1,0 +1,21 @@
+{
+  "game_url": "https://YOUR-SITE-HERE.example/",
+  "history_selector": ".text-w-60",
+  "history_selectors": [
+    ".px-1 > .text-w-60",
+    ".px-1 .text-w-60"
+  ],
+  "poll_seconds": 0.05,
+  "snapshot_scan_seconds": 0.2,
+  "heartbeat_seconds": 60,
+  "reconnect_seconds": 5,
+  "minimum_new_round_gap_seconds": 1.5,
+  "require_source": "real",
+  "collect_round_context": true,
+  "participant_count_selector": ".flight-radar-participants-count",
+  "headless": false,
+  "strategy": {
+    "lookback": 3,
+    "low_multiplier_threshold": 1.5
+  }
+}

@@ -1,0 +1,11 @@
+.venv/
+.pycache_tmp/
+__pycache__/
+*.py[cod]
+
+config.json
+
+data/*
+!data/.gitkeep
+
+.DS_Store
