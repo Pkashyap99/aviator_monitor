@@ -24,15 +24,17 @@ from aviator_analyzer import (
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "data"
 CSV_PATH = DATA_DIR / "rounds.csv"
+CONFIG_PATH = ROOT / "config.json"
 PREDICTION_STATE_PATH = DATA_DIR / "prediction_state.json"
 PREDICTION_HISTORY_PATH = DATA_DIR / "prediction_history.csv"
 RANGE_PREDICTION_HISTORY_PATH = DATA_DIR / "range_prediction_history.csv"
 ROUND_CONTEXT_PATH = DATA_DIR / "round_context.csv"
-RANGE_MODEL_VERSION = "adaptive-v3"
+RANGE_MODEL_VERSION = "adaptive-v4"
 DASHBOARD_DIR = ROOT / "dashboard"
 TRACKED_TARGETS = [1.5, 2.0, 3.0, 5.0, 10.0, 25.0, 50.0, 100.0]
 TRACKING_LOCK = threading.Lock()
 BACKTEST_LOCK = threading.Lock()
+DISPLAY_MONEY_LOCK = threading.Lock()
 DASHBOARD_CACHE = {}
 CACHE_MAX_ITEMS = 12
 ACCURACY_SUMMARY_CACHE = {
@@ -41,12 +43,30 @@ ACCURACY_SUMMARY_CACHE = {
 }
 BACKTEST_REFRESH_SECONDS = 20
 PARTICIPANT_CONTEXT_LIVE_SECONDS = 5
+RECENT_CONTEXT_MAX_ROWS = 2500
+RECENT_CONTEXT_MAX_BYTES = 1024 * 1024
 BACKTEST_CACHE = {
     "key": None,
     "generated_at": 0,
     "in_progress": False,
     "items": [],
 }
+DISPLAY_MONEY_CACHE = {
+    "signature": None,
+    "settings": None,
+    "checked_at": 0,
+}
+DISPLAY_MONEY_REFRESH_SECONDS = 2
+DISPLAY_MONEY_FIELDS = {
+    "total_bet": "display_total_bet",
+    "avg_bet": "display_avg_bet",
+    "max_bet": "display_max_bet",
+    "total_win": "display_total_win",
+    "max_win": "display_max_win",
+}
+DEFAULT_DISPLAY_CURRENCY = "INR"
+DEFAULT_EUR_TO_INR_RATE = 100.0
+DEFAULT_DOM_DISPLAY_CURRENCY = "INR"
 WARM_CACHE_QUERIES = [
     {
         "lookback": ["2"],
@@ -146,12 +166,31 @@ def refresh_cached_ingest(payload):
                     payload["round_context"][key]
                 )
 
+        participants = payload["round_context"].get("participants")
+
+        if (
+            participants
+            and participants.get("age_seconds") is not None
+            and participants.get("age_seconds") > PARTICIPANT_CONTEXT_LIVE_SECONDS
+        ):
+            payload["round_context"]["participants"] = None
+
+    payload["round_context"] = latest_round_context()
+
+    with BACKTEST_LOCK:
+        if (
+            payload.get("_backtest_key") == BACKTEST_CACHE["key"]
+            and BACKTEST_CACHE["items"]
+        ):
+            payload["backtests"] = list(BACKTEST_CACHE["items"])
+
     payload["generated_at"] = now_string()
     payload["cache_age_ms"] = int(
         (time.monotonic() - payload.get("_cached_at", time.monotonic()))
         * 1000
     )
     payload.pop("_cached_at", None)
+    payload.pop("_backtest_key", None)
     return payload
 
 
@@ -177,6 +216,54 @@ def file_signature(path):
     )
 
 
+def recent_csv_rows(path, max_rows, max_bytes):
+    if not path.exists():
+        return []
+
+    try:
+        with path.open("rb") as f:
+            header = f.readline().decode(
+                "utf-8",
+                errors="ignore",
+            ).strip()
+
+            if not header:
+                return []
+
+            f.seek(0, 2)
+            size = f.tell()
+            read_from = max(
+                0,
+                size - max_bytes,
+            )
+            f.seek(read_from)
+            text = f.read().decode(
+                "utf-8",
+                errors="ignore",
+            )
+    except OSError:
+        return []
+
+    lines = text.splitlines()
+
+    if read_from > 0 and lines:
+        lines = lines[1:]
+
+    if lines and lines[0].strip() == header:
+        lines = lines[1:]
+
+    lines = lines[-max_rows:]
+
+    if not lines:
+        return []
+
+    return list(
+        csv.DictReader(
+            [header, *lines]
+        )
+    )
+
+
 def parse_context_float(value):
     if value in (None, ""):
         return None
@@ -194,6 +281,119 @@ def parse_context_int(value):
         return None
 
     return int(number)
+
+
+def display_money_settings():
+    now = time.monotonic()
+
+    with DISPLAY_MONEY_LOCK:
+        if (
+            DISPLAY_MONEY_CACHE["settings"] is not None
+            and now - DISPLAY_MONEY_CACHE["checked_at"]
+            < DISPLAY_MONEY_REFRESH_SECONDS
+        ):
+            return DISPLAY_MONEY_CACHE["settings"]
+
+    signature = file_signature(CONFIG_PATH)
+
+    with DISPLAY_MONEY_LOCK:
+        if (
+            DISPLAY_MONEY_CACHE["signature"] == signature
+            and DISPLAY_MONEY_CACHE["settings"] is not None
+        ):
+            DISPLAY_MONEY_CACHE["checked_at"] = now
+            return DISPLAY_MONEY_CACHE["settings"]
+
+    settings = {
+        "currency": DEFAULT_DISPLAY_CURRENCY,
+        "eur_to_inr_rate": DEFAULT_EUR_TO_INR_RATE,
+        "dom_currency": DEFAULT_DOM_DISPLAY_CURRENCY,
+    }
+
+    if CONFIG_PATH.exists():
+        try:
+            with CONFIG_PATH.open("r", encoding="utf-8") as f:
+                config = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            config = {}
+
+        currency = str(
+            config.get("display_currency", DEFAULT_DISPLAY_CURRENCY)
+        ).strip().upper()
+        dom_currency = str(
+            config.get(
+                "dom_display_currency",
+                DEFAULT_DOM_DISPLAY_CURRENCY,
+            )
+        ).strip().upper()
+
+        try:
+            eur_to_inr_rate = float(
+                config.get(
+                    "display_eur_to_inr_rate",
+                    DEFAULT_EUR_TO_INR_RATE,
+                )
+            )
+        except (TypeError, ValueError):
+            eur_to_inr_rate = DEFAULT_EUR_TO_INR_RATE
+
+        if currency:
+            settings["currency"] = currency
+
+        if dom_currency:
+            settings["dom_currency"] = dom_currency
+
+        if eur_to_inr_rate > 0:
+            settings["eur_to_inr_rate"] = eur_to_inr_rate
+
+    with DISPLAY_MONEY_LOCK:
+        DISPLAY_MONEY_CACHE["signature"] = signature
+        DISPLAY_MONEY_CACHE["settings"] = settings
+        DISPLAY_MONEY_CACHE["checked_at"] = now
+
+    return settings
+
+
+def context_money_source_unit(context):
+    source = str(
+        context.get("source", "")
+    ).lower()
+
+    if "worker_top" in source:
+        return "EUR"
+
+    if "participants_dom" in source:
+        return display_money_settings()["dom_currency"]
+
+    return ""
+
+
+def decorate_context_display_money(context):
+    if not context:
+        return context
+
+    settings = display_money_settings()
+    display_currency = settings["currency"]
+    source_unit = context_money_source_unit(context)
+    display_rate = 1.0
+
+    if display_currency == "INR" and source_unit == "EUR":
+        display_rate = settings["eur_to_inr_rate"]
+
+    context["display_currency"] = display_currency
+    context["money_source_unit"] = source_unit
+    context["display_money_rate"] = round_float(display_rate)
+
+    for source_key, display_key in DISPLAY_MONEY_FIELDS.items():
+        value = context.get(source_key)
+
+        context[display_key] = (
+            round_float(value * display_rate)
+            if value is not None
+            else None
+        )
+
+    return context
 
 
 def update_round_context_age(context):
@@ -264,8 +464,124 @@ def context_from_row(row):
         ),
     }
 
-    return update_round_context_age(
+    return decorate_context_display_money(
+        update_round_context_age(
+            context
+        )
+    )
+
+
+def is_participant_context_source(source):
+    lowered = str(
+        source or ""
+    ).lower()
+
+    return (
+        lowered == "participants_dom"
+        or "participants" in lowered
+        or "userbets" in lowered
+    )
+
+
+def best_participant_context(rows):
+    candidates = []
+
+    for row in rows:
+        if not is_participant_context_source(
+            row.get("source", "")
+        ):
+            continue
+
+        context = context_from_row(
+            row
+        )
+
+        if not context:
+            continue
+
+        candidates.append(
+            context
+        )
+
+    if not candidates:
+        return None
+
+    fresh_candidates = [
         context
+        for context in candidates
+        if (
+            context.get("age_seconds") is None
+            or context.get("age_seconds") <= PARTICIPANT_CONTEXT_LIVE_SECONDS
+        )
+    ]
+
+    active_candidates = [
+        context
+        for context in fresh_candidates
+        if context.get("source") == "participants_worker_active"
+    ]
+    detail_candidates = [
+        context
+        for context in fresh_candidates
+        if context.get("bet_count") is not None
+    ]
+    active_context = (
+        max(
+            active_candidates,
+            key=lambda context: context.get("observed_at") or "",
+        )
+        if active_candidates
+        else None
+    )
+
+    if detail_candidates:
+        best_detail = max(
+            detail_candidates,
+            key=lambda context: (
+                context.get("player_count") or 0,
+                context.get("bet_count") or 0,
+                context.get("payload_records") or 0,
+                context.get("observed_at") or "",
+            )
+        )
+
+        if (
+            active_context
+            and (active_context.get("player_count") or 0)
+            > (best_detail.get("player_count") or 0)
+        ):
+            best_detail = dict(
+                best_detail
+            )
+            best_detail["player_count"] = active_context.get(
+                "player_count"
+            )
+            best_detail["active_source"] = active_context.get(
+                "source"
+            )
+            best_detail["active_observed_at"] = active_context.get(
+                "observed_at"
+            )
+
+        return best_detail
+
+    if active_context:
+        return active_context
+
+    if fresh_candidates:
+        return max(
+            fresh_candidates,
+            key=lambda context: (
+                context.get("player_count") or 0,
+                context.get("bet_count") or 0,
+                context.get("payload_records") or 0,
+                context.get("observed_at") or "",
+            )
+        )
+
+    return max(
+        candidates,
+        key=lambda context: context.get("observed_at") or ""
     )
 
 
@@ -282,25 +598,32 @@ def latest_round_context():
 
     latest = None
     by_source = {}
+    participant_rows = []
 
-    try:
-        with ROUND_CONTEXT_PATH.open("r", newline="", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
+    rows = recent_csv_rows(
+        ROUND_CONTEXT_PATH,
+        RECENT_CONTEXT_MAX_ROWS,
+        RECENT_CONTEXT_MAX_BYTES,
+    )
 
-            for row in reader:
-                if (
-                    row.get("source") == "flight_radar_dom"
-                    and not parse_context_int(
-                        row.get("player_count")
-                    )
-                ):
-                    continue
+    for row in rows:
+        if (
+            row.get("source") == "flight_radar_dom"
+            and not parse_context_int(
+                row.get("player_count")
+            )
+        ):
+            continue
 
-                latest = row
-                by_source[row.get("source", "")] = row
+        latest = row
+        by_source[row.get("source", "")] = row
 
-    except OSError:
-        return empty
+        if is_participant_context_source(
+            row.get("source", "")
+        ):
+            participant_rows.append(
+                row
+            )
 
     if not latest:
         return empty
@@ -313,10 +636,8 @@ def latest_round_context():
             "flight_radar_dom"
         )
     )
-    participants = context_from_row(
-        by_source.get(
-            "participants_dom"
-        )
+    participants = best_participant_context(
+        participant_rows
     )
     context["last_participants"] = participants
 
@@ -339,6 +660,7 @@ def build_live_report(
     min_matches,
     calibration=None,
     data_selection=None,
+    include_backtests=True,
 ):
     values = [
         round_data["multiplier"]
@@ -350,20 +672,26 @@ def build_live_report(
         min_matches,
     )
 
-    maybe_refresh_backtests(
-        values,
-        lookback,
-        targets,
-        min_matches,
-        backtest_key,
-    )
+    if include_backtests:
+        maybe_refresh_backtests(
+            values,
+            lookback,
+            targets,
+            min_matches,
+            backtest_key,
+        )
 
     with BACKTEST_LOCK:
-        backtests = list(BACKTEST_CACHE["items"])
+        backtests = (
+            list(BACKTEST_CACHE["items"])
+            if include_backtests
+            else []
+        )
 
     return {
         "generated_at": now_string(),
         "csv_rounds": len(rounds),
+        "_backtest_key": backtest_key,
         "data_selection": data_selection or {},
         "summary": summarize(values),
         "overall_probabilities": target_probabilities(values, targets),
@@ -668,6 +996,8 @@ def accuracy_for_rows(rows):
             "checked": 0,
             "correct": 0,
             "accuracy": None,
+            "baseline_accuracy": None,
+            "skill": None,
         }
 
     correct = sum(
@@ -675,11 +1005,27 @@ def accuracy_for_rows(rows):
         for row in rows
         if parse_bool_int(row.get("correct", "0"))
     )
+    actual_high_values = [
+        parse_bool_int(row.get("actual_high", "0"))
+        for row in rows
+        if row.get("actual_high", "") != ""
+    ]
+    baseline_accuracy = None
+    skill = None
+    accuracy = correct / len(rows)
+
+    if len(actual_high_values) == len(rows):
+        high_count = sum(1 for value in actual_high_values if value)
+        low_count = len(actual_high_values) - high_count
+        baseline_accuracy = max(high_count, low_count) / len(actual_high_values)
+        skill = accuracy - baseline_accuracy
 
     return {
         "checked": len(rows),
         "correct": correct,
-        "accuracy": correct / len(rows),
+        "accuracy": accuracy,
+        "baseline_accuracy": baseline_accuracy,
+        "skill": skill,
     }
 
 
@@ -725,6 +1071,22 @@ def build_accuracy_summary():
         target_accuracy[key] = accuracy_for_rows(
             target_rows[-100:]
         )
+    useful_targets = [
+        {
+            "target": target,
+            **item,
+        }
+        for target, item in target_accuracy.items()
+        if item.get("checked", 0) >= 50 and item.get("skill") is not None
+    ]
+    best_target = (
+        max(
+            useful_targets,
+            key=lambda item: item["skill"],
+        )
+        if useful_targets
+        else None
+    )
 
     return {
         "windows": windows,
@@ -733,6 +1095,7 @@ def build_accuracy_summary():
         "clear": accuracy_for_rows(clear_rows[-300:]),
         "weak": accuracy_for_rows(weak_rows[-300:]),
         "targets": target_accuracy,
+        "best_target": best_target,
     }
 
 
@@ -856,18 +1219,23 @@ def learn_profile_and_margin(calls):
         for call in calls
         if call.get("components")
     ]
+    majority_accuracy = majority_accuracy_for_calls(component_calls)
 
     if len(component_calls) < 12:
         return {
             "profile": "balanced",
             "decision_margin": learn_decision_margin(calls),
             "profile_accuracy": None,
+            "majority_accuracy": majority_accuracy,
+            "profile_skill": None,
         }
 
     best = {
         "profile": "balanced",
         "decision_margin": 0,
         "profile_accuracy": -1,
+        "majority_accuracy": majority_accuracy,
+        "profile_skill": None,
         "balanced_accuracy": -1,
         "brier": 1,
     }
@@ -934,11 +1302,30 @@ def learn_profile_and_margin(calls):
                     "profile": profile_name,
                     "decision_margin": margin,
                     "profile_accuracy": accuracy,
+                    "majority_accuracy": majority_accuracy,
+                    "profile_skill": (
+                        accuracy - majority_accuracy
+                        if majority_accuracy is not None
+                        else None
+                    ),
                     "balanced_accuracy": balanced_accuracy,
                     "brier": brier,
                 }
 
     return best
+
+
+def majority_accuracy_for_calls(calls):
+    if not calls:
+        return None
+
+    positives = sum(
+        1
+        for call in calls
+        if bool(call.get("actual_high"))
+    )
+    negatives = len(calls) - positives
+    return max(positives, negatives) / len(calls)
 
 
 def build_calibration(metrics):
@@ -973,6 +1360,8 @@ def build_calibration(metrics):
             "decision_margin": strategy["decision_margin"],
             "profile": strategy["profile"],
             "profile_accuracy": strategy["profile_accuracy"],
+            "profile_majority_accuracy": strategy.get("majority_accuracy"),
+            "profile_skill": strategy.get("profile_skill"),
             "recent_balanced_accuracy": strategy.get("balanced_accuracy"),
             "recent_brier": strategy.get("brier"),
         }
@@ -1328,6 +1717,7 @@ def compact_report(report, rounds):
 
     return {
         "generated_at": report["generated_at"],
+        "_backtest_key": report.get("_backtest_key"),
         "warning": report["warning"],
         "data_selection": report.get("data_selection", {}),
         "ingest": ingest_status(rounds),
@@ -1365,7 +1755,102 @@ def compact_report(report, rounds):
     }
 
 
-def build_dashboard_payload(query):
+def compact_live_prediction(prediction):
+    return {
+        "target": prediction.get("target"),
+        "probability": prediction.get("probability"),
+        "baseline_probability": prediction.get("baseline_probability"),
+        "edge": prediction.get("edge"),
+        "predicted_high": prediction.get("predicted_high"),
+        "confidence": prediction.get("confidence"),
+        "signal": prediction.get("signal"),
+        "clear_signal": prediction.get("clear_signal"),
+        "clear_reason": prediction.get("clear_reason"),
+    }
+
+
+def compact_live_tracking(tracking):
+    if not tracking:
+        return None
+
+    pending = tracking.get("pending")
+    compact_pending = None
+
+    if pending:
+        compact_pending = {
+            "predicted_at": pending.get("predicted_at"),
+            "after_round_count": pending.get("after_round_count"),
+            "latest_multiplier": pending.get("latest_multiplier"),
+            "range_prediction": pending.get("range_prediction"),
+        }
+
+    last_result = tracking.get("last_result")
+    compact_last_result = None
+
+    if last_result:
+        compact_last_result = {
+            "score_id": last_result.get("score_id"),
+            "actual_multiplier": last_result.get("actual_multiplier"),
+            "range_result": last_result.get("range_result"),
+            "results": [
+                {
+                    "target": item.get("target"),
+                    "predicted_high": item.get("predicted_high"),
+                    "actual_high": item.get("actual_high"),
+                    "correct": item.get("correct"),
+                    "probability": item.get("probability"),
+                    "baseline_probability": item.get("baseline_probability"),
+                }
+                for item in last_result.get("results", [])
+            ],
+        }
+
+    return {
+        "pending": compact_pending,
+        "metrics": {},
+        "range_metrics": tracking.get("range_metrics", {}),
+        "last_result": compact_last_result,
+    }
+
+
+def compact_live_payload(payload):
+    summary = payload.get("summary", {})
+    next_round = payload.get("next_round", {})
+
+    return {
+        "generated_at": payload.get("generated_at"),
+        "warning": payload.get("warning"),
+        "data_selection": payload.get("data_selection", {}),
+        "ingest": payload.get("ingest", {}),
+        "round_context": payload.get("round_context"),
+        "summary": {
+            "rounds": summary.get("rounds", 0),
+            "latest_multiplier": summary.get("latest_multiplier"),
+            "average": summary.get("average"),
+            "median": summary.get("median"),
+            "p90": summary.get("p90"),
+            "maximum": summary.get("maximum"),
+            "buckets": summary.get("buckets", {}),
+        },
+        "next_round": {
+            "lookback": next_round.get("lookback"),
+            "latest_pattern": next_round.get("latest_pattern", []),
+            "pattern_match_count": next_round.get("pattern_match_count", 0),
+            "range_estimate": next_round.get("range_estimate"),
+            "predictions": [
+                compact_live_prediction(prediction)
+                for prediction in next_round.get("predictions", [])
+            ],
+        },
+        "tracking": compact_live_tracking(
+            payload.get("tracking")
+        ),
+        "accuracy_summary": payload.get("accuracy_summary"),
+        "cache_age_ms": payload.get("cache_age_ms"),
+    }
+
+
+def build_dashboard_payload(query, include_backtests=True):
     with TRACKING_LOCK:
         lookback = parse_int(
             query.get("lookback", ["2"])[0],
@@ -1381,15 +1866,16 @@ def build_dashboard_payload(query):
         )
 
         current_csv_signature = csv_signature()
-        current_context_signature = file_signature(
-            ROUND_CONTEXT_PATH
+        current_config_signature = file_signature(
+            CONFIG_PATH
         )
 
         cache_key = (
             lookback,
             min_matches,
+            include_backtests,
             current_csv_signature,
-            current_context_signature,
+            current_config_signature,
         )
         cached = DASHBOARD_CACHE.get(cache_key)
 
@@ -1454,6 +1940,7 @@ def build_dashboard_payload(query):
             min_matches=min_matches,
             calibration=calibration,
             data_selection=data_selection,
+            include_backtests=include_backtests,
         )
         tracking = update_prediction_tracking(
             rounds,
@@ -1476,7 +1963,10 @@ def build_dashboard_payload(query):
 
 def warm_dashboard_cache_once():
     for query in WARM_CACHE_QUERIES:
-        build_dashboard_payload(query)
+        build_dashboard_payload(
+            query,
+            include_backtests=False,
+        )
 
 
 def start_cache_warmer():
@@ -1487,9 +1977,7 @@ def start_cache_warmer():
             try:
                 current_signature = (
                     csv_signature(),
-                    file_signature(
-                        ROUND_CONTEXT_PATH
-                    ),
+                    file_signature(CONFIG_PATH),
                 )
 
                 if current_signature != last_signature:
@@ -1520,6 +2008,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.end_headers()
             return
 
+        if parsed.path == "/api/live":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            return
+
         if parsed.path in ("", "/"):
             self.send_file_headers(DASHBOARD_DIR / "index.html")
             return
@@ -1539,6 +2034,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/summary":
             self.send_json(
                 build_dashboard_payload(parse_qs(parsed.query))
+            )
+            return
+
+        if parsed.path == "/api/live":
+            self.send_json(
+                compact_live_payload(
+                    build_dashboard_payload(
+                        parse_qs(parsed.query),
+                        include_backtests=False,
+                    )
+                )
             )
             return
 

@@ -3,9 +3,11 @@ const state = {
   lastRoundCount: 0,
   inFlight: false,
   pendingRefresh: false,
+  lastRenderSignature: "",
 };
 
 const REFRESH_MS = 100;
+const LIVE_ENDPOINT = "/api/live";
 const PARTICIPANT_CONTEXT_FRESH_SECONDS = 5;
 
 const elements = {
@@ -73,6 +75,16 @@ function formatPercent(value) {
   return `${(Number(value) * 100).toFixed(1)}%`;
 }
 
+function formatSignedPercent(value) {
+  if (value === null || value === undefined) {
+    return "--";
+  }
+
+  const number = Number(value);
+  const sign = number > 0 ? "+" : "";
+  return `${sign}${(number * 100).toFixed(1)}%`;
+}
+
 function formatContextNumber(value) {
   if (value === null || value === undefined) {
     return "--";
@@ -103,6 +115,58 @@ function formatMoney(value) {
   return amount.toFixed(2);
 }
 
+function formatIndianMoney(value) {
+  if (value === null || value === undefined) {
+    return "--";
+  }
+
+  const amount = Number(value);
+
+  if (!Number.isFinite(amount)) {
+    return "--";
+  }
+
+  const absAmount = Math.abs(amount);
+
+  if (absAmount >= 10000000) {
+    return `Rs ${(amount / 10000000).toFixed(2)}Cr`;
+  }
+
+  if (absAmount >= 100000) {
+    return `Rs ${(amount / 100000).toFixed(2)}L`;
+  }
+
+  if (absAmount >= 1000) {
+    return `Rs ${(amount / 1000).toFixed(2)}K`;
+  }
+
+  return `Rs ${amount.toFixed(2)}`;
+}
+
+function formatDisplayMoney(value, currency) {
+  const normalizedCurrency = String(currency || "").toUpperCase();
+
+  if (normalizedCurrency === "INR") {
+    return formatIndianMoney(value);
+  }
+
+  if (normalizedCurrency) {
+    return `${normalizedCurrency} ${formatMoney(value)}`;
+  }
+
+  return formatMoney(value);
+}
+
+function displayMoneyValue(context, key) {
+  const displayKey = `display_${key}`;
+
+  if (context[displayKey] !== null && context[displayKey] !== undefined) {
+    return context[displayKey];
+  }
+
+  return context[key];
+}
+
 function setStatus(kind, text) {
   elements.status.classList.remove("live", "error");
 
@@ -129,7 +193,9 @@ function formatAge(seconds) {
 
 function liveDataLabel(data) {
   const selection = data.data_selection || {};
-  const mode = selection.using_source_only || selection.mode === "real"
+  const mode = selection.using_trusted_sources
+    ? "REAL + HISTORY"
+    : selection.using_source_only || selection.mode === "real"
     ? "REAL DATA"
     : "ALL DATA";
 
@@ -149,7 +215,9 @@ function liveDataDetail(data, cashoutText) {
     ? `last round ${formatAge(data.ingest.last_round_age_seconds)} ago`
     : "last round unknown";
   const selection = data.data_selection || {};
-  const roundCount = selection.using_source_only
+  const roundCount = selection.using_trusted_sources
+    ? `${selection.trusted_rounds} real+history rounds`
+    : selection.using_source_only
     ? `${selection.source_rounds} real rounds`
     : `${data.summary ? data.summary.rounds : "--"} rounds`;
 
@@ -550,23 +618,62 @@ function renderAccuracySummary(summary) {
     return;
   }
 
-  const windows = summary.windows || {};
-  const skipped = summary.range_skipped ? `skipped ${summary.range_skipped}` : null;
+  const range = summary.range || {};
+  const rangeText = range.checked
+    ? `range ${formatPercent(range.accuracy)} (${range.checked} scored)`
+    : "range collecting";
+  const skipped = summary.range_skipped ? `${summary.range_skipped} weak skipped` : null;
+  const bestTarget = summary.best_target || null;
+  const edgeText = bestTarget && bestTarget.skill !== null && bestTarget.skill !== undefined
+    ? bestTarget.skill > 0
+      ? `best edge >=${Number(bestTarget.target).toFixed(2)}x ${formatSignedPercent(bestTarget.skill)}`
+      : "no target beating baseline"
+    : "edge waiting";
   const parts = [
-    formatAccuracyItem("range", summary.range, 10),
+    rangeText,
     skipped,
-    formatAccuracyItem("100", windows["100"]),
-    formatAccuracyItem("300", windows["300"]),
-    formatAccuracyItem("1000", windows["1000"]),
-    formatAccuracyItem("clear", summary.clear),
+    edgeText,
   ].filter(Boolean);
 
   elements.accuracySummaryText.textContent = `Accuracy: ${parts.join(" | ")}`;
 }
 
+function hasUsefulModelEdge(summary) {
+  const bestTarget = summary && summary.best_target ? summary.best_target : null;
+
+  if (!bestTarget || bestTarget.skill === null || bestTarget.skill === undefined) {
+    return false;
+  }
+
+  return Number(bestTarget.skill) >= 0.02;
+}
+
+function shouldShowNoEdge(data, range, direct) {
+  const rangeIsClear = Boolean(range && range.clear_signal);
+  const directIsClear = Boolean(
+    direct
+    && !direct.weak
+    && direct.prediction
+    && direct.prediction.clear_signal
+  );
+
+  return !hasUsefulModelEdge(data.accuracy_summary)
+    && !rangeIsClear
+    && !directIsClear;
+}
+
 function renderSourceMode(selection) {
   if (!selection) {
     elements.sourceModeText.textContent = "Data: checking";
+    return;
+  }
+
+  if (selection.using_trusted_sources) {
+    const excluded = selection.excluded_rounds
+      ? `, ${selection.excluded_rounds} demo excluded`
+      : "";
+
+    elements.sourceModeText.textContent = `Data: real + history (${selection.trusted_rounds} rounds${excluded})`;
     return;
   }
 
@@ -579,6 +686,14 @@ function renderSourceMode(selection) {
 }
 
 function participantContextParts(participants) {
+  const source = String(participants.source || "").toLowerCase();
+  const isWorkerTop = source.includes("worker_top");
+  const displayCurrency = participants.display_currency || "";
+  const betLabel = isWorkerTop
+    ? "top streamed bets"
+    : "visible bets";
+  const betMoneyLabel = isWorkerTop ? "top bet" : "bet";
+  const winMoneyLabel = isWorkerTop ? "made" : "made";
   const cashoutLabel = participants.cashed_out_count !== null
     && participants.cashed_out_count !== undefined
     && participants.bet_count !== null
@@ -592,10 +707,10 @@ function participantContextParts(participants) {
 
   return [
     participants.bet_count !== null && participants.bet_count !== undefined
-      ? `${participants.bet_count} visible bets`
-      : "visible bets",
+      ? `${participants.bet_count} ${betLabel}`
+      : betLabel,
     participants.total_bet !== null && participants.total_bet !== undefined
-      ? `bet ${formatMoney(participants.total_bet)}`
+      ? `${betMoneyLabel} ${formatDisplayMoney(displayMoneyValue(participants, "total_bet"), displayCurrency)}`
       : null,
     cashoutLabel,
     participants.avg_cashout !== null && participants.avg_cashout !== undefined
@@ -605,7 +720,7 @@ function participantContextParts(participants) {
       ? `max out ${formatCashoutMultiplier(participants.max_cashout)}`
       : null,
     participants.total_win !== null && participants.total_win !== undefined
-      ? `made ${formatMoney(participants.total_win)}`
+      ? `${winMoneyLabel} ${formatDisplayMoney(displayMoneyValue(participants, "total_win"), displayCurrency)}`
       : null,
   ].filter(Boolean);
 }
@@ -693,7 +808,7 @@ function renderRoundContext(context) {
   }
 
   if (context.total_bet !== null && context.total_bet !== undefined) {
-    parts.push(`bet ${formatContextNumber(context.total_bet)}`);
+    parts.push(`bet ${formatDisplayMoney(displayMoneyValue(context, "total_bet"), context.display_currency)}`);
   }
 
   if (context.cashed_out_count !== null && context.cashed_out_count !== undefined) {
@@ -806,6 +921,17 @@ function renderFastPrediction(data) {
     return;
   }
 
+  if (shouldShowNoEdge(data, range, direct)) {
+    elements.fastMain.classList.add("fast-range");
+    elements.fastPredictionText.textContent = "NO CLEAR EDGE";
+    elements.fastPredictionMeta.textContent = "Model is not beating baseline yet";
+    elements.signalStrengthText.textContent = "Signal: WEAK - no target beating baseline";
+    elements.bigWatchText.textContent = bigMultiplierWatch(predictions);
+    elements.fastSignalText.textContent = liveDataLabel(data);
+    elements.cashoutGuideText.textContent = liveDataDetail(data, "skip or use very low target only");
+    return;
+  }
+
   const main = display.prediction;
   elements.fastMain.classList.add(display.tone);
   elements.fastPredictionText.textContent = display.predictionText;
@@ -863,7 +989,7 @@ function renderBacktests(backtests) {
     row.innerHTML = `
       <span>>=${Number(item.target).toFixed(2)}x</span>
       <strong>${item.accuracy === null ? "n/a" : formatPercent(item.accuracy)}</strong>
-      <span>${formatPercent(item.coverage)} coverage</span>
+      <span>${formatPercent(item.coverage)} coverage - edge ${formatSignedPercent(item.skill)}</span>
     `;
     elements.backtestList.appendChild(row);
   }
@@ -1106,21 +1232,21 @@ function render(data) {
   }
 
   if (elements.overallList.offsetParent !== null) {
-    renderOverall(data.overall_probabilities);
+    renderOverall(data.overall_probabilities || {});
   }
 
   if (elements.backtestList.offsetParent !== null) {
-    renderBacktests(data.backtests);
+    renderBacktests(data.backtests || []);
   }
 
   renderTracking(data.tracking);
 
   if (elements.recentRounds.offsetParent !== null) {
-    renderRecentRounds(data.recent_rounds);
+    renderRecentRounds(data.recent_rounds || []);
   }
 
   if (elements.chart.offsetParent !== null) {
-    drawChart(data.chart_rounds);
+    drawChart(data.chart_rounds || []);
   }
 
   const changed = summary.rounds !== state.lastRoundCount;
@@ -1131,6 +1257,47 @@ function render(data) {
   } else {
     setStatus("live", changed ? "Live - new data" : "Live");
   }
+}
+
+function buildRenderSignature(data) {
+  const summary = data.summary || {};
+  const ingest = data.ingest || {};
+  const context = data.round_context || {};
+  const radar = context.radar || {};
+  const participants = context.participants || {};
+  const tracking = data.tracking || {};
+  const lastResult = tracking.last_result || {};
+  const nextRound = data.next_round || {};
+  const range = nextRound.range_estimate || {};
+  const predictions = nextRound.predictions || [];
+
+  return JSON.stringify({
+    rounds: summary.rounds,
+    latest: summary.latest_multiplier,
+    age: ingest.last_round_age_seconds,
+    radarAt: radar.observed_at || context.observed_at,
+    radarPlayers: radar.player_count || context.player_count,
+    participantsAt: participants.observed_at,
+    participantPlayers: participants.player_count,
+    betCount: participants.bet_count,
+    totalBet: participants.total_bet,
+    displayCurrency: participants.display_currency,
+    displayTotalBet: participants.display_total_bet,
+    cashouts: participants.cashed_out_count,
+    totalWin: participants.total_win,
+    displayTotalWin: participants.display_total_win,
+    rangeLabel: range.short || range.label,
+    rangeSignal: range.clear_signal,
+    predictionSignals: predictions.map((item) => [
+      item.target,
+      item.probability,
+      item.predicted_high,
+      item.clear_signal,
+      item.signal,
+    ]),
+    lastScore: lastResult.score_id,
+    lastActual: lastResult.actual_multiplier,
+  });
 }
 
 async function refresh() {
@@ -1148,7 +1315,7 @@ async function refresh() {
   });
 
   try {
-    const response = await fetch(`/api/summary?${params.toString()}`, {
+    const response = await fetch(`${LIVE_ENDPOINT}?${params.toString()}`, {
       cache: "no-store",
     });
 
@@ -1157,7 +1324,12 @@ async function refresh() {
     }
 
     const data = await response.json();
-    render(data);
+    const signature = buildRenderSignature(data);
+
+    if (signature !== state.lastRenderSignature) {
+      state.lastRenderSignature = signature;
+      render(data);
+    }
   } catch (error) {
     setStatus("error", "Disconnected");
     console.error(error);

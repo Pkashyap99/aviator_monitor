@@ -16,6 +16,8 @@ DEFAULT_TARGETS = [1.5, 2.0, 3.0, 5.0, 10.0, 25.0, 50.0, 100.0]
 RECENT_WINDOW = 80
 DEDUPLICATE_WINDOW_SECONDS = 6
 MIN_REAL_ROUNDS_FOR_PREDICTION = 300
+LEGACY_SOURCES = {"", "unlabeled", "legacy"}
+EXCLUDED_PREDICTION_SOURCES = {"demo"}
 RANGE_BUCKETS = [
     {
         "label": "LESS THAN 1.20x",
@@ -306,12 +308,18 @@ def load_rounds(path):
     return rounds
 
 
+def source_label(source):
+    if source in LEGACY_SOURCES:
+        return "unlabeled"
+
+    return source or "unlabeled"
+
+
 def source_counts(rounds):
     counts = Counter()
 
     for round_data in rounds:
-        source = round_data.get("source") or "unlabeled"
-        counts[source] += 1
+        counts[source_label(round_data.get("source", ""))] += 1
 
     return dict(counts)
 
@@ -327,6 +335,39 @@ def select_prediction_rounds(rounds, preferred_source="real", minimum_source_rou
         for round_data in rounds
         if round_data.get("source") == preferred_source
     ]
+    trusted_rounds = [
+        round_data
+        for round_data in rounds
+        if (
+            round_data.get("source") == preferred_source
+            or round_data.get("source", "") in LEGACY_SOURCES
+        )
+    ]
+    legacy_round_count = sum(
+        1
+        for round_data in rounds
+        if round_data.get("source", "") in LEGACY_SOURCES
+    )
+    excluded_round_count = sum(
+        1
+        for round_data in rounds
+        if source_label(round_data.get("source", "")) in EXCLUDED_PREDICTION_SOURCES
+    )
+
+    if len(trusted_rounds) >= minimum and legacy_round_count:
+        return trusted_rounds, {
+            "mode": "trusted",
+            "preferred_source": preferred_source,
+            "minimum_source_rounds": minimum,
+            "using_source_only": False,
+            "using_trusted_sources": True,
+            "source_rounds": len(source_rounds),
+            "legacy_rounds": legacy_round_count,
+            "trusted_rounds": len(trusted_rounds),
+            "excluded_rounds": excluded_round_count,
+            "total_rounds": len(rounds),
+            "counts": source_counts(rounds),
+        }
 
     if len(source_rounds) >= minimum:
         return source_rounds, {
@@ -334,7 +375,11 @@ def select_prediction_rounds(rounds, preferred_source="real", minimum_source_rou
             "preferred_source": preferred_source,
             "minimum_source_rounds": minimum,
             "using_source_only": True,
+            "using_trusted_sources": False,
             "source_rounds": len(source_rounds),
+            "legacy_rounds": legacy_round_count,
+            "trusted_rounds": len(source_rounds),
+            "excluded_rounds": len(rounds) - len(source_rounds),
             "total_rounds": len(rounds),
             "counts": source_counts(rounds),
         }
@@ -344,7 +389,11 @@ def select_prediction_rounds(rounds, preferred_source="real", minimum_source_rou
         "preferred_source": preferred_source,
         "minimum_source_rounds": minimum,
         "using_source_only": False,
+        "using_trusted_sources": False,
         "source_rounds": len(source_rounds),
+        "legacy_rounds": legacy_round_count,
+        "trusted_rounds": len(trusted_rounds),
+        "excluded_rounds": 0,
         "total_rounds": len(rounds),
         "counts": source_counts(rounds),
     }
@@ -491,27 +540,35 @@ def adaptive_range_quality(candidate, evidence_score):
     probability_value = candidate["probability"]
     edge = candidate["probability"] - candidate["baseline_probability"]
     bucket_count = len(candidate["bucket_labels"])
+    maximum = candidate.get("maximum")
+    minimum = candidate.get("minimum", 1.0)
+
+    if maximum is not None and maximum > 2.0:
+        return False, "low", "range has not beaten baseline", edge
+
+    if minimum > 1.0:
+        return False, "low", "range has not beaten baseline", edge
 
     if (
-        probability_value >= 0.62
-        and edge >= 0.025
-        and evidence_score >= 0.38
+        probability_value >= 0.68
+        and edge >= 0.08
+        and evidence_score >= 0.55
         and bucket_count <= 3
     ):
         return True, "high", "clear wider range", edge
 
     if (
-        probability_value >= 0.54
-        and edge >= 0.025
-        and evidence_score >= 0.35
+        probability_value >= 0.62
+        and edge >= 0.06
+        and evidence_score >= 0.50
         and bucket_count <= 3
     ):
         return True, "medium", "clear wider range", edge
 
-    if probability_value < 0.50:
+    if probability_value < 0.58:
         return False, "low", "wider range probability too low", edge
 
-    if edge < 0.02:
+    if edge < 0.06:
         return False, "low", "wider range has no edge", edge
 
     return False, "low", "wider range not strong enough", edge
@@ -845,6 +902,7 @@ def calibrated_probability(raw_probability, baseline, calibration):
     checked = int(calibration.get("checked", 0))
     recent_accuracy = calibration.get("recent_accuracy")
     recent_balanced_accuracy = calibration.get("recent_balanced_accuracy")
+    profile_skill = calibration.get("profile_skill")
     quality = (
         recent_balanced_accuracy
         if recent_balanced_accuracy is not None
@@ -863,6 +921,16 @@ def calibrated_probability(raw_probability, baseline, calibration):
         edge_weight = 1.10
     else:
         edge_weight = 0.85
+
+    if (
+        checked >= 50
+        and profile_skill is not None
+        and profile_skill < 0.02
+    ):
+        edge_weight = min(
+            edge_weight,
+            0.10 if profile_skill < 0 else 0.20,
+        )
 
     adjusted = baseline + (raw_probability - baseline) * edge_weight
     return clamp(adjusted, 0, 1), edge_weight
@@ -960,6 +1028,11 @@ def next_round_prediction(values, lookback, targets, calibration=None):
             decision_margin,
             target,
         )
+        if (
+            (predicted_high and signal == "AVOID")
+            or (not predicted_high and signal == "FAVOR")
+        ):
+            signal = "NEUTRAL"
         evidence = {
             "recent_rounds": len(recent_sample),
             "pattern_matches": len(pattern_sample),
@@ -981,6 +1054,7 @@ def next_round_prediction(values, lookback, targets, calibration=None):
         recent_balanced_accuracy = target_calibration.get(
             "recent_balanced_accuracy"
         )
+        profile_skill = target_calibration.get("profile_skill")
 
         if (
             recent_balanced_accuracy is not None
@@ -989,6 +1063,15 @@ def next_round_prediction(values, lookback, targets, calibration=None):
         ):
             clear_signal = False
             clear_reason = "recently unreliable"
+
+        if (
+            profile_skill is not None
+            and int(target_calibration.get("checked", 0)) >= 50
+            and profile_skill < 0.02
+        ):
+            signal = "NEUTRAL"
+            clear_signal = False
+            clear_reason = "no edge over baseline"
 
         predictions.append(
             {
@@ -1043,6 +1126,8 @@ def backtest(values, lookback, target, min_matches):
             "lookback": lookback,
             "tested_rounds": 0,
             "accuracy": None,
+            "baseline_accuracy": None,
+            "skill": None,
             "coverage": 0,
         }
 
@@ -1050,6 +1135,7 @@ def backtest(values, lookback, target, min_matches):
     correct = 0
     tested = 0
     high_predictions = 0
+    actual_high_count = 0
     start_index = max(lookback + 1, len(values) - 500)
 
     for round_index in range(start_index, len(values)):
@@ -1069,6 +1155,7 @@ def backtest(values, lookback, target, min_matches):
 
         predicted_high = prediction["predicted_high"]
         actual_high = values[round_index] >= target
+        actual_high_count += int(actual_high)
 
         if predicted_high:
             high_predictions += 1
@@ -1078,6 +1165,17 @@ def backtest(values, lookback, target, min_matches):
 
         tested += 1
 
+    if tested:
+        baseline_correct = max(
+            actual_high_count,
+            tested - actual_high_count,
+        )
+        baseline_accuracy = baseline_correct / tested
+        accuracy = correct / tested
+    else:
+        baseline_accuracy = None
+        accuracy = None
+
     return {
         "target": target,
         "lookback": lookback,
@@ -1085,7 +1183,13 @@ def backtest(values, lookback, target, min_matches):
         "method": "ensemble",
         "tested_rounds": tested,
         "coverage": tested / max(len(values) - start_index, 1),
-        "accuracy": correct / tested if tested else None,
+        "accuracy": accuracy,
+        "baseline_accuracy": baseline_accuracy,
+        "skill": (
+            accuracy - baseline_accuracy
+            if accuracy is not None and baseline_accuracy is not None
+            else None
+        ),
         "baseline_probability": baseline_probability,
         "high_predictions": high_predictions,
     }
@@ -1132,12 +1236,23 @@ def print_report(report):
     data_selection = report.get("data_selection") or {}
 
     if data_selection:
+        if data_selection.get("using_trusted_sources"):
+            data_mode = (
+                "trusted "
+                f"({data_selection.get('trusted_rounds', 0)} real+legacy / "
+                f"{data_selection.get('total_rounds', summary['rounds'])} total; "
+                f"excluded {data_selection.get('excluded_rounds', 0)})"
+            )
+        else:
+            data_mode = (
+                f"{data_selection.get('mode', 'all')} "
+                f"({data_selection.get('source_rounds', 0)} real / "
+                f"{data_selection.get('total_rounds', summary['rounds'])} total; "
+                f"switch at {data_selection.get('minimum_source_rounds', 0)} real)"
+            )
+
         print(
-            "Data mode: "
-            f"{data_selection.get('mode', 'all')} "
-            f"({data_selection.get('source_rounds', 0)} real / "
-            f"{data_selection.get('total_rounds', summary['rounds'])} total; "
-            f"switch at {data_selection.get('minimum_source_rounds', 0)} real)"
+            f"Data mode: {data_mode}"
         )
 
     print(f"Rounds analyzed: {summary['rounds']}")
@@ -1181,11 +1296,23 @@ def print_report(report):
             if result["accuracy"] is not None
             else "not enough data"
         )
+        baseline_accuracy = (
+            format_probability(result["baseline_accuracy"])
+            if result.get("baseline_accuracy") is not None
+            else "n/a"
+        )
+        skill = (
+            format_probability(result["skill"])
+            if result.get("skill") is not None
+            else "n/a"
+        )
 
         print(
             f"  >={result['target']:.2f}x: {accuracy}, "
             f"coverage {format_probability(result['coverage'])}, "
-            f"baseline {format_probability(result['baseline_probability'])}"
+            f"majority baseline {baseline_accuracy}, "
+            f"skill {skill}, "
+            f"target frequency {format_probability(result['baseline_probability'])}"
         )
 
 

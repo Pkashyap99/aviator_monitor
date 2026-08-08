@@ -63,6 +63,7 @@ The analyzer reads `data/rounds.csv`, prints:
 - historical probabilities for targets like `>=2.00x`
 - an ensemble next-round probability estimate that blends baseline, recent history, pattern matches, and current streak context
 - backtest accuracy compared with the historical baseline
+- skill versus a simple majority baseline, so broad easy calls do not look better than they really are
 - confidence, signal, and edge versus baseline for each target
 
 It also writes:
@@ -87,7 +88,8 @@ Open:
 http://127.0.0.1:8765
 ```
 
-The dashboard reads `data/rounds.csv` every second and shows live totals, recent rounds, target probabilities, ensemble next-round probability estimates, confidence, signal, and backtest accuracy.
+The dashboard polls `data/rounds.csv` quickly for live updates and shows the next-round estimate, previous prediction result, data source mode, live context, and compact accuracy tracking.
+For prediction history, it uses real rows plus legacy unlabeled rows and excludes rows explicitly marked as demo.
 
 The dashboard also tracks whether each previous prediction matched the next actual multiplier. It writes:
 
@@ -99,6 +101,8 @@ data/prediction_state.json
 Those results are used to calibrate future prediction edges. If recent tracking accuracy is weak, the model automatically shrinks its edge back toward the historical baseline.
 It also learns a small per-target decision margin from recent checked predictions, then uses that margin for future HIGH/LOW calls.
 The live model can also switch per-target blend profiles, such as `balanced`, `defensive`, `recent_heavy`, `pattern_heavy`, and `streak_heavy`, based on which profile has matched best in recent tracking.
+Range predictions are scored only when the model sees a measurable edge; weak ranges are still displayed as estimates, but are skipped in accuracy tracking.
+When recent learned profiles do not beat the majority baseline, the dashboard suppresses the edge and shows `NO CLEAR EDGE` instead of presenting a weak call as actionable.
 
 ## Files
 

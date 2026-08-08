@@ -89,6 +89,12 @@ PAGE_WATCHER_INTERVAL_MS = 25
 
 DEFAULT_SNAPSHOT_SCAN_SECONDS = 0.2
 
+WATCHER_DRAIN_TIMEOUT_SECONDS = 0.5
+
+PAGE_READ_TIMEOUT_SECONDS = 1.0
+
+SLOW_CONTEXT_READ_TIMEOUT_SECONDS = 1.5
+
 
 # =========================================================
 # MULTIPLIER REGEX
@@ -103,6 +109,7 @@ ROUND_ID_KEYS = {
     "round",
     "gameroundid",
     "betroundid",
+    "gameid",
 }
 
 BET_AMOUNT_KEYS = {
@@ -120,6 +127,12 @@ CASHOUT_MULTIPLIER_KEYS = {
     "cashoutmultiplier",
     "cashoutcoefficient",
     "cashoutcoef",
+    "cashoutodd",
+    "cashoutodds",
+    "coefficient",
+    "coef",
+    "odd",
+    "odds",
 }
 
 WIN_AMOUNT_KEYS = {
@@ -138,6 +151,7 @@ PLAYER_KEYS = {
     "username",
     "nickname",
     "playername",
+    "displayname",
     "name",
 }
 
@@ -151,6 +165,7 @@ STATUS_KEYS = {
 CONTEXT_RESPONSE_MARKERS = (
     "getuserbets",
     "bets",
+    "participants",
     "round",
     "history",
     "cashout",
@@ -199,6 +214,18 @@ def log(message):
 
     with LOG_PATH.open("a", encoding="utf-8") as f:
         f.write(line + "\n")
+
+
+async def page_read_with_timeout(awaitable, timeout_seconds, default=None):
+    try:
+        return await asyncio.wait_for(
+            awaitable,
+            timeout=timeout_seconds
+        )
+    except asyncio.TimeoutError:
+        return default
+    except Exception:
+        return default
 
 
 def load_config():
@@ -626,23 +653,47 @@ def extract_bet_records(value, inherited_round_id=None):
 
 
 def is_cashed_out_record(record, cashout_multiplier, win_amount):
-    if cashout_multiplier is not None and cashout_multiplier >= 1:
-        return True
-
-    if win_amount is not None and win_amount > 0:
-        return True
-
     status = direct_payload_value(
         record,
         STATUS_KEYS
     )
 
-    if status is None:
-        return False
+    status_text = (
+        str(
+            status
+        ).lower()
+        if status is not None
+        else ""
+    )
 
-    status_text = str(
-        status
-    ).lower()
+    if status_text:
+        if any(
+            marker in status_text
+            for marker in (
+                "pending",
+                "lost",
+                "cancel",
+                "reject",
+            )
+        ):
+            return False
+
+        if any(
+            marker in status_text
+            for marker in (
+                "cash",
+                "win",
+                "success",
+                "paid",
+            )
+        ):
+            return True
+
+    if win_amount is not None and win_amount > 0:
+        return True
+
+    if cashout_multiplier is not None and cashout_multiplier >= 1:
+        return True
 
     return any(
         marker in status_text
@@ -719,27 +770,28 @@ def summarize_round_context(payload):
                 WIN_AMOUNT_KEYS
             )
         )
+        cashed_out = is_cashed_out_record(
+            record,
+            cashout_multiplier,
+            win_amount
+        )
 
         if bet_amount is not None:
             summary["bet_values"].append(
                 bet_amount
             )
 
-        if cashout_multiplier is not None:
+        if cashed_out and cashout_multiplier is not None:
             summary["cashout_values"].append(
                 cashout_multiplier
             )
 
-        if win_amount is not None:
+        if cashed_out and win_amount is not None and win_amount > 0:
             summary["win_values"].append(
                 win_amount
             )
 
-        if is_cashed_out_record(
-            record,
-            cashout_multiplier,
-            win_amount
-        ):
+        if cashed_out:
             summary["cashed_out_count"] += 1
 
     return list(
@@ -797,13 +849,22 @@ def round_context_row(summary, source, game_source):
     bet_values = summary["bet_values"]
     cashout_values = summary["cashout_values"]
     win_values = summary["win_values"]
+    player_count = summary.get(
+        "player_count_override"
+    )
+
+    if player_count is None and summary["players"]:
+        player_count = len(
+            summary["players"]
+        )
+
     row = {
         "observed_at": now_string(),
         "round_id": summary["round_id"],
         "source": source,
         "game_source": game_source,
         "player_count": context_count(
-            len(summary["players"]) if summary["players"] else None
+            player_count
         ),
         "bet_count": context_count(
             len(bet_values) if bet_values else summary["payload_records"]
@@ -1067,6 +1128,236 @@ def append_visible_participants_context(context, game_source):
         )
 
 
+def append_worker_active_participant_context(
+    player_count,
+    round_id,
+    game_source,
+    observed_hashes
+):
+    if player_count is None:
+        return 0
+
+    row = {
+        "observed_at": now_string(),
+        "round_id": round_id or "",
+        "source": "participants_worker_active",
+        "game_source": game_source,
+        "player_count": context_count(
+            player_count
+        ),
+        "bet_count": "",
+        "total_bet": "",
+        "avg_bet": "",
+        "max_bet": "",
+        "cashed_out_count": "",
+        "avg_cashout": "",
+        "max_cashout": "",
+        "total_win": "",
+        "max_win": "",
+        "payload_records": "1",
+        "context_hash": "",
+    }
+    row["context_hash"] = context_signature(
+        row
+    )
+
+    if row["context_hash"] in observed_hashes:
+        return 0
+
+    with ROUND_CONTEXT_PATH.open(
+        "a",
+        newline="",
+        encoding="utf-8"
+    ) as f:
+
+        writer = csv.DictWriter(
+            f,
+            fieldnames=ROUND_CONTEXT_HEADERS
+        )
+
+        writer.writerow(
+            row
+        )
+
+        f.flush()
+        os.fsync(
+            f.fileno()
+        )
+
+    observed_hashes.add(
+        row["context_hash"]
+    )
+
+    return 1
+
+
+def first_outcome_round_id(outcome_counts):
+    if not isinstance(outcome_counts, dict) or not outcome_counts:
+        return ""
+
+    return next(
+        iter(
+            outcome_counts.keys()
+        ),
+        ""
+    )
+
+
+def normalize_worker_participant_record(record):
+    if not isinstance(record, dict):
+        return record
+
+    normalized = dict(
+        record
+    )
+    outcome_id = record.get(
+        "outcomeId",
+        ""
+    )
+
+    if outcome_id:
+        normalized["roundId"] = outcome_id
+
+    # Worker events contain global currencies. Prefer EUR fields so aggregate
+    # totals use one common unit instead of mixing INR/KRW/EUR/etc.
+    if record.get("amountEur") is not None:
+        normalized["betAmount"] = record.get(
+            "amountEur"
+        )
+        normalized["amount"] = record.get(
+            "amountEur"
+        )
+    elif record.get("betAmountEur") is not None:
+        normalized["betAmount"] = record.get(
+            "betAmountEur"
+        )
+        normalized["amount"] = record.get(
+            "betAmountEur"
+        )
+
+    if record.get("winAmountEur") is not None:
+        normalized["winAmount"] = record.get(
+            "winAmountEur"
+        )
+
+    return normalized
+
+
+def extract_worker_participant_events(value):
+    events = []
+
+    if isinstance(value, dict):
+        if "activeParticipantsEvent" in value:
+            events.append(
+                (
+                    "active",
+                    value.get(
+                        "activeParticipantsEvent"
+                    )
+                )
+            )
+
+        if "topParticipantsEvent" in value:
+            events.append(
+                (
+                    "top",
+                    value.get(
+                        "topParticipantsEvent"
+                    )
+                )
+            )
+
+        for child in value.values():
+            events.extend(
+                extract_worker_participant_events(
+                    child
+                )
+            )
+
+    elif isinstance(value, list):
+        for child in value:
+            events.extend(
+                extract_worker_participant_events(
+                    child
+                )
+            )
+
+    return events
+
+
+def process_worker_participant_payload(
+    payload,
+    game_source,
+    observed_context_hashes
+):
+    rows_written = 0
+
+    for event_type, event in extract_worker_participant_events(
+        payload
+    ):
+        if not isinstance(event, dict):
+            continue
+
+        total_active = finite_context_number(
+            number_from_value(
+                event.get(
+                    "totalActiveParticipants"
+                )
+            ),
+            maximum=1_000_000
+        )
+        outcome_counts = event.get(
+            "outcomeActiveParticipants",
+            {}
+        )
+        round_id = first_outcome_round_id(
+            outcome_counts
+        )
+
+        if event_type == "active":
+            rows_written += append_worker_active_participant_context(
+                total_active,
+                round_id,
+                game_source,
+                observed_context_hashes
+            )
+            continue
+
+        participants = event.get(
+            "participants",
+            []
+        )
+
+        if not isinstance(participants, list):
+            continue
+
+        normalized_payload = {
+            "roundId": round_id,
+            "participants": [
+                normalize_worker_participant_record(
+                    participant
+                )
+                for participant in participants
+            ],
+        }
+        summaries = summarize_round_context(
+            normalized_payload
+        )
+
+        if total_active is not None:
+            for summary in summaries:
+                summary["player_count_override"] = total_active
+
+        rows_written += append_round_context_summaries(
+            summaries,
+            "participants_worker_top",
+            game_source,
+            observed_context_hashes
+        )
+
+    return rows_written
+
+
 def backup_rounds_csv():
     if not CSV_PATH.exists():
         return
@@ -1094,6 +1385,33 @@ def backup_rounds_csv():
     log(
         f"Backed up rounds CSV to {backup_path.name}"
     )
+
+
+def load_recent_round_values(limit=80):
+    if not CSV_PATH.exists():
+        return []
+
+    rows = []
+
+    try:
+        with CSV_PATH.open("r", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+
+            for row in reader:
+                try:
+                    rows.append(
+                        round(
+                            float(row.get("multiplier", "")),
+                            2
+                        )
+                    )
+                except (TypeError, ValueError):
+                    continue
+
+    except OSError:
+        return []
+
+    return rows[-limit:]
 
 
 def acquire_collector_lock():
@@ -1360,8 +1678,6 @@ async def read_visible_participants_table(page):
                 value || ""
               ).replace(/\\s+/g, " ").trim();
 
-              const bodyText = clean(document.body.innerText || "");
-
               const parseCompactNumber = (value) => {
                 const text = clean(value).replace(/,/g, "");
                 const match = text.match(/^(\\d+(?:\\.\\d+)?)([KMB])?$/i);
@@ -1405,15 +1721,10 @@ async def read_visible_participants_table(page):
               const hasVisibleParticipantAmount = Array
                 .from(document.querySelectorAll(".players-row-amount"))
                 .some((node) => isVisible(node));
+              const participantsRoot = document.querySelector(".players-table")
+                || document.querySelector("[class*='players-table']");
 
-              if (
-                !hasVisibleParticipantAmount
-                && (
-                  !/Participants/i.test(bodyText)
-                  || !/My bets/i.test(bodyText)
-                  || !/Promos/i.test(bodyText)
-                )
-              ) {
+              if (!hasVisibleParticipantAmount && !participantsRoot) {
                 return null;
               }
 
@@ -1514,7 +1825,11 @@ async def read_visible_participants_table(page):
 
               const readClassBasedParticipantRows = () => {
                 const amountNodes = Array
-                  .from(document.querySelectorAll(".players-row-amount"))
+                  .from(
+                    (participantsRoot || document).querySelectorAll(
+                      ".players-row-amount"
+                    )
+                  )
                   .filter((node) => isVisible(node));
                 const rows = [];
                 const seen = new Set();
@@ -1633,7 +1948,8 @@ async def read_visible_participants_table(page):
                 return classBasedSummary;
               }
 
-              const nodes = Array.from(document.querySelectorAll("body *"));
+              const scanRoot = participantsRoot || document.body;
+              const nodes = Array.from(scanRoot.querySelectorAll("*"));
               const visibleTextNodes = [];
 
               for (const node of nodes) {
@@ -2168,6 +2484,82 @@ def response_source_label(response_url):
     )[:80]
 
 
+def request_payload_from_response(response):
+    request = getattr(
+        response,
+        "request",
+        None
+    )
+
+    if request is None:
+        return None
+
+    for attribute in (
+        "post_data_json",
+        "post_data",
+    ):
+        try:
+            value = getattr(
+                request,
+                attribute,
+                None
+            )
+
+            if callable(value):
+                value = value()
+
+        except Exception:
+            continue
+
+        if not value:
+            continue
+
+        if isinstance(value, (dict, list)):
+            return value
+
+        try:
+            return json.loads(
+                value
+            )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+
+    return None
+
+
+def attach_request_round_id(payload, request_payload):
+    if not isinstance(request_payload, dict):
+        return payload
+
+    round_id = extract_payload_round_id(
+        request_payload
+    )
+
+    if not round_id:
+        return payload
+
+    if isinstance(payload, dict):
+        if extract_payload_round_id(
+            payload
+        ):
+            return payload
+
+        wrapped = {
+            "roundId": round_id,
+            **payload,
+        }
+
+        return wrapped
+
+    if isinstance(payload, list):
+        return {
+            "roundId": round_id,
+            "items": payload,
+        }
+
+    return payload
+
+
 def process_context_payload(
     payload,
     source_label,
@@ -2245,6 +2637,13 @@ async def install_round_id_observer(page, collect_round_context=True):
         except Exception:
             return
 
+        payload = attach_request_round_id(
+            payload,
+            request_payload_from_response(
+                response
+            )
+        )
+
         process_context_payload(
             payload,
             source_label,
@@ -2301,6 +2700,90 @@ async def install_round_id_observer(page, collect_round_context=True):
                 collect_round_context
             )
 
+    worker_sessions = set()
+    attached_worker_targets = set()
+    worker_message_counter = {
+        "next": 1,
+    }
+    worker_stats = {
+        "rows": 0,
+        "last_log": 0,
+    }
+
+    def is_realtime_worker_target(target_info):
+        if not isinstance(target_info, dict):
+            return False
+
+        return (
+            target_info.get("type") == "worker"
+            and "realtime.worker" in target_info.get("url", "")
+        )
+
+    def handle_worker_cdp_message(event):
+        session_id = event.get(
+            "sessionId",
+            ""
+        )
+
+        if session_id not in worker_sessions:
+            return
+
+        try:
+            message = json.loads(
+                event.get(
+                    "message",
+                    "{}"
+                )
+            )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return
+
+        if message.get("method") != "Network.webSocketFrameReceived":
+            return
+
+        payload_text = decode_frame_payload(
+            message.get(
+                "params",
+                {}
+            ).get(
+                "response",
+                {}
+            ).get(
+                "payloadData",
+                ""
+            )
+        )
+
+        if "participants" not in payload_text.lower():
+            return
+
+        rows_written = 0
+
+        for payload in json_payloads_from_text(
+            payload_text
+        ):
+            rows_written += process_worker_participant_payload(
+                payload,
+                page_source(
+                    page.url
+                ),
+                observed_context_hashes
+            )
+
+        if not rows_written:
+            return
+
+        worker_stats["rows"] += rows_written
+        current_time = time.monotonic()
+
+        if current_time - worker_stats["last_log"] >= 10:
+            log(
+                "Captured "
+                f"{worker_stats['rows']} worker participant context rows."
+            )
+            worker_stats["rows"] = 0
+            worker_stats["last_log"] = current_time
+
     page.on(
         "response",
         lambda response: asyncio.create_task(
@@ -2318,6 +2801,64 @@ async def install_round_id_observer(page, collect_round_context=True):
         await cdp_session.send(
             "Network.enable"
         )
+
+        async def send_worker_cdp(session_id, method, params=None):
+            message_id = worker_message_counter["next"]
+            worker_message_counter["next"] += 1
+            await cdp_session.send(
+                "Target.sendMessageToTarget",
+                {
+                    "sessionId": session_id,
+                    "message": json.dumps(
+                        {
+                            "id": message_id,
+                            "method": method,
+                            "params": params or {},
+                        }
+                    ),
+                }
+            )
+
+        async def attach_realtime_worker_target(target_id):
+            if not target_id or target_id in attached_worker_targets:
+                return
+
+            try:
+                attached = await cdp_session.send(
+                    "Target.attachToTarget",
+                    {
+                        "targetId": target_id,
+                        "flatten": False,
+                    }
+                )
+                session_id = attached.get(
+                    "sessionId",
+                    ""
+                )
+
+                if not session_id:
+                    return
+
+                attached_worker_targets.add(
+                    target_id
+                )
+                worker_sessions.add(
+                    session_id
+                )
+
+                await send_worker_cdp(
+                    session_id,
+                    "Network.enable"
+                )
+
+                log(
+                    "Installed realtime worker participant observer."
+                )
+
+            except Exception as exc:
+                log(
+                    f"WARNING: Could not attach realtime worker observer: {exc}"
+                )
 
         cdp_session.on(
             "Network.webSocketCreated",
@@ -2337,6 +2878,65 @@ async def install_round_id_observer(page, collect_round_context=True):
             "Network.webSocketFrameReceived",
             handle_websocket_frame
         )
+        cdp_session.on(
+            "Target.receivedMessageFromTarget",
+            handle_worker_cdp_message
+        )
+        cdp_session.on(
+            "Target.targetCreated",
+            lambda event: (
+                asyncio.create_task(
+                    attach_realtime_worker_target(
+                        event.get(
+                            "targetInfo",
+                            {}
+                        ).get(
+                            "targetId",
+                            ""
+                        )
+                    )
+                )
+                if is_realtime_worker_target(
+                    event.get(
+                        "targetInfo",
+                        {}
+                    )
+                )
+                else None
+            )
+        )
+
+        try:
+            targets = await cdp_session.send(
+                "Target.getTargets"
+            )
+
+            for target_info in targets.get(
+                "targetInfos",
+                []
+            ):
+                if is_realtime_worker_target(
+                    target_info
+                ):
+                    await attach_realtime_worker_target(
+                        target_info.get(
+                            "targetId",
+                            ""
+                        )
+                    )
+
+            await cdp_session.send(
+                "Target.setDiscoverTargets",
+                {
+                    "discover": True,
+                }
+            )
+
+        except Exception as exc:
+            log(
+                f"WARNING: Could not scan realtime workers: {exc}"
+            )
+
         setattr(
             page,
             "_aviator_context_cdp_session",
@@ -2479,6 +3079,44 @@ def find_new_values(old_snapshot, new_snapshot):
     # - selector/order changes
     #
     # Don't blindly import everything.
+    return []
+
+
+def recover_new_values_from_recent_csv(new_snapshot, recent_values):
+    if not new_snapshot or not recent_values:
+        return []
+
+    max_shift = min(
+        len(new_snapshot),
+        40
+    )
+    anchor_lengths = [
+        12,
+        8,
+        5,
+        3,
+    ]
+
+    for anchor_length in anchor_lengths:
+        if len(recent_values) < anchor_length:
+            continue
+
+        anchor = list(
+            reversed(
+                recent_values[-anchor_length:]
+            )
+        )
+
+        for shift in range(
+            0,
+            max_shift + 1
+        ):
+            if shift + anchor_length > len(new_snapshot):
+                break
+
+            if new_snapshot[shift:shift + anchor_length] == anchor:
+                return new_snapshot[:shift]
+
     return []
 
 
@@ -2639,9 +3277,13 @@ async def initialize_history(
         []
     )
 
-    current = await read_multipliers_reliably(
-        page,
-        selector
+    current = await page_read_with_timeout(
+        read_multipliers_reliably(
+            page,
+            selector
+        ),
+        PAGE_READ_TIMEOUT_SECONDS * 3,
+        default=[]
     )
 
     if not current:
@@ -2813,6 +3455,8 @@ async def monitor_page(
 
     last_participant_table_write_at = 0
 
+    last_participant_table_log_at = 0
+
     observed_seed_pairs = load_observed_seed_pairs()
 
     last_appended_multiplier = None
@@ -2862,6 +3506,85 @@ async def monitor_page(
             f"NEW ROUND: {multiplier:.2f}x"
         )
 
+    async def flush_history_watcher_queue():
+        nonlocal previous_snapshot
+        nonlocal no_overlap_count
+
+        watcher_state = await page_read_with_timeout(
+            drain_history_watcher(
+                page
+            ),
+            WATCHER_DRAIN_TIMEOUT_SECONDS,
+            default=None
+        )
+
+        if not watcher_state or not watcher_state.get("queue"):
+            return False
+
+        queued_events = watcher_state.get(
+            "queue",
+            []
+        )
+
+        if len(queued_events) > MAX_NEW_VALUES_PER_SCAN:
+
+            log(
+                "WARNING: Page watcher found "
+                f"{len(queued_events)} possible rounds, above safe limit. "
+                "Dropping queued batch and resetting snapshot."
+            )
+
+        else:
+
+            for event in queued_events:
+
+                try:
+                    if isinstance(event, dict):
+                        multiplier = float(
+                            event.get(
+                                "value"
+                            )
+                        )
+                        round_id = event.get(
+                            "roundId"
+                        )
+                        detected_at = timestamp_from_millis(
+                            event.get(
+                                "detectedAt"
+                            )
+                        )
+                    else:
+                        multiplier = float(
+                            event
+                        )
+                        round_id = None
+                        detected_at = now_string()
+
+                    if multiplier < 1:
+                        continue
+
+                except (TypeError, ValueError):
+                    continue
+
+                append_live_round(
+                    multiplier,
+                    detected_at,
+                    round_id
+                )
+
+        previous_snapshot = watcher_state.get(
+            "snapshot",
+            previous_snapshot
+        )
+
+        save_state(
+            previous_snapshot
+        )
+
+        no_overlap_count = 0
+
+        return True
+
     while True:
 
         try:
@@ -2883,15 +3606,22 @@ async def monitor_page(
 
             current_source = live_source
 
+            await flush_history_watcher_queue()
+
             if (
                 collect_round_context
                 and time.time() - last_participant_scan >= PARTICIPANT_SCAN_SECONDS
             ):
-                participant_count = await read_participant_count(
-                    page,
-                    participant_count_selector
-                )
                 last_participant_scan = time.time()
+
+                participant_count = await page_read_with_timeout(
+                    read_participant_count(
+                        page,
+                        participant_count_selector
+                    ),
+                    PAGE_READ_TIMEOUT_SECONDS,
+                    default=None
+                )
 
                 if participant_count is not None:
                     current_time = time.monotonic()
@@ -2933,10 +3663,15 @@ async def monitor_page(
                 collect_round_context
                 and time.time() - last_participant_table_scan >= PARTICIPANT_TABLE_SCAN_SECONDS
             ):
-                table_context = await read_visible_participants_table(
-                    page
-                )
                 last_participant_table_scan = time.time()
+
+                table_context = await page_read_with_timeout(
+                    read_visible_participants_table(
+                        page
+                    ),
+                    SLOW_CONTEXT_READ_TIMEOUT_SECONDS,
+                    default=None
+                )
 
                 if table_context:
                     current_time = time.monotonic()
@@ -2958,73 +3693,18 @@ async def monitor_page(
                         last_participant_table_signature = table_signature
                         last_participant_table_write_at = current_time
 
-                        if table_changed:
+                        if (
+                            table_changed
+                            and current_time - last_participant_table_log_at >= 5
+                        ):
                             log(
                                 "Captured visible participants table aggregate: "
                                 f"{int(table_context.get('visible_rows', 0))} rows, "
                                 f"{context_number(table_context.get('total_bet')) or 'unknown'} total bet."
                             )
+                            last_participant_table_log_at = current_time
 
-            watcher_state = await drain_history_watcher(
-                page
-            )
-
-            if watcher_state and watcher_state.get("queue"):
-
-                queued_events = watcher_state.get(
-                    "queue",
-                    []
-                )
-
-                if len(queued_events) > MAX_NEW_VALUES_PER_SCAN:
-
-                    log(
-                        "WARNING: Page watcher found "
-                        f"{len(queued_events)} possible rounds, above safe limit. "
-                        "Dropping queued batch and resetting snapshot."
-                    )
-
-                else:
-
-                    for event in queued_events:
-
-                        if isinstance(event, dict):
-                            multiplier = float(
-                                event.get(
-                                    "value"
-                                )
-                            )
-                            round_id = event.get(
-                                "roundId"
-                            )
-                            detected_at = timestamp_from_millis(
-                                event.get(
-                                    "detectedAt"
-                                )
-                            )
-                        else:
-                            multiplier = float(
-                                event
-                            )
-                            round_id = None
-                            detected_at = now_string()
-
-                        append_live_round(
-                            multiplier,
-                            detected_at,
-                            round_id
-                        )
-
-                previous_snapshot = watcher_state.get(
-                    "snapshot",
-                    previous_snapshot
-                )
-
-                save_state(
-                    previous_snapshot
-                )
-
-                no_overlap_count = 0
+            await flush_history_watcher_queue()
 
             did_snapshot_scan = False
             current_snapshot = []
@@ -3033,20 +3713,28 @@ async def monitor_page(
 
                 did_snapshot_scan = True
 
-                current_snapshot = await read_multipliers(
-                    page,
-                    selector
-                )
-
                 last_snapshot_scan = time.time()
+
+                current_snapshot = await page_read_with_timeout(
+                    read_multipliers(
+                        page,
+                        selector
+                    ),
+                    PAGE_READ_TIMEOUT_SECONDS,
+                    default=[]
+                )
 
             if time.time() - last_seed_scan >= 5:
 
-                seed_data = await read_visible_provably_fair_seed(
-                    page
-                )
-
                 last_seed_scan = time.time()
+
+                seed_data = await page_read_with_timeout(
+                    read_visible_provably_fair_seed(
+                        page
+                    ),
+                    PAGE_READ_TIMEOUT_SECONDS,
+                    default=None
+                )
 
                 if seed_data:
 
@@ -3117,26 +3805,61 @@ async def monitor_page(
 
                     elif current_snapshot != previous_snapshot:
 
-                        no_overlap_count += 1
-
-                        log(
-                            "WARNING: Snapshot changed but no reliable overlap was found "
-                            f"({no_overlap_count}/3)."
+                        recovered_values = recover_new_values_from_recent_csv(
+                            current_snapshot,
+                            load_recent_round_values()
                         )
 
-                        if no_overlap_count < 3:
+                        if recovered_values:
 
-                            await asyncio.sleep(
-                                fast_poll_seconds
+                            if len(recovered_values) > MAX_NEW_VALUES_PER_SCAN:
+
+                                log(
+                                    "WARNING: CSV anchor recovery found "
+                                    f"{len(recovered_values)} possible new rounds, "
+                                    f"above safe limit of {MAX_NEW_VALUES_PER_SCAN}. "
+                                    "Resetting snapshot without appending old history."
+                                )
+
+                            else:
+
+                                log(
+                                    "Recovered "
+                                    f"{len(recovered_values)} rounds using recent CSV anchor."
+                                )
+
+                                for multiplier in reversed(
+                                    recovered_values
+                                ):
+
+                                    append_live_round(
+                                        multiplier
+                                    )
+
+                            no_overlap_count = 0
+
+                        else:
+
+                            no_overlap_count += 1
+
+                            log(
+                                "WARNING: Snapshot changed but no reliable overlap was found "
+                                f"({no_overlap_count}/3)."
                             )
 
-                            continue
+                            if no_overlap_count < 3:
 
-                        log(
-                            "Resetting snapshot to current visible history so live tracking can continue."
-                        )
+                                await asyncio.sleep(
+                                    fast_poll_seconds
+                                )
 
-                        no_overlap_count = 0
+                                continue
+
+                            log(
+                                "Resetting snapshot to current visible history so live tracking can continue."
+                            )
+
+                            no_overlap_count = 0
 
                     else:
 
