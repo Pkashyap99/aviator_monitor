@@ -1,6 +1,7 @@
 import argparse
 import csv
 import json
+import math
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
@@ -12,221 +13,150 @@ DEFAULT_CSV_PATH = DATA_DIR / "rounds.csv"
 DEFAULT_REPORT_PATH = DATA_DIR / "analysis.json"
 
 
-DEFAULT_TARGETS = [1.5, 2.0, 3.0, 5.0, 10.0, 25.0, 50.0, 100.0]
+DEFAULT_TARGETS = [1.5, 2.0, 3.0, 5.0, 10.0, 20.0, 25.0, 50.0, 100.0]
 RECENT_WINDOW = 80
+MULTI_PATTERN_LOOKBACKS = [1, 2, 3, 4]
+MULTI_PATTERN_MATCH_LIMIT = 320
+CONFIDENCE_RANGE_TARGET = 0.81
+CONFIDENCE_RANGE_NEAR_TARGET = 0.79
+CONFIDENCE_RANGE_MIN_EDGE = 0.015
+CONFIDENCE_RANGE_MAXIMUM = 5.0
+CONFIDENCE_RANGE_MAX_BUCKETS = 10
+ACTIONABLE_RANGE_MAXIMUM = 3.0
+ACTIONABLE_RANGE_MAX_BUCKETS = 6
 DEDUPLICATE_WINDOW_SECONDS = 6
 MIN_REAL_ROUNDS_FOR_PREDICTION = 300
 LEGACY_SOURCES = {"", "unlabeled", "legacy"}
-EXCLUDED_PREDICTION_SOURCES = {"demo"}
+LIVE_GAME_SOURCES = {"real", "demo"}
+EXCLUDED_PREDICTION_SOURCES = set()
+
+
+def make_range_label(minimum, maximum):
+    if maximum is None:
+        return (
+            f"MORE THAN {minimum:.2f}x",
+            f"{minimum:.2f}x+",
+        )
+
+    return (
+        f"{minimum:.2f}x TO {maximum:.2f}x",
+        f"{minimum:.2f}x-{maximum:.2f}x",
+    )
+
+
+def make_range_bucket(minimum, maximum):
+    label, short = make_range_label(minimum, maximum)
+    return {
+        "label": label,
+        "short": short,
+        "minimum": minimum,
+        "maximum": maximum,
+    }
+
+
 RANGE_BUCKETS = [
-    {
-        "label": "LESS THAN 1.20x",
-        "short": "<1.20x",
-        "minimum": 1.0,
-        "maximum": 1.2,
-    },
-    {
-        "label": "1.20x TO 1.50x",
-        "short": "1.20x-1.50x",
-        "minimum": 1.2,
-        "maximum": 1.5,
-    },
-    {
-        "label": "1.50x TO 2.00x",
-        "short": "1.50x-2.00x",
-        "minimum": 1.5,
-        "maximum": 2.0,
-    },
-    {
-        "label": "2.00x TO 3.00x",
-        "short": "2.00x-3.00x",
-        "minimum": 2.0,
-        "maximum": 3.0,
-    },
-    {
-        "label": "3.00x TO 5.00x",
-        "short": "3.00x-5.00x",
-        "minimum": 3.0,
-        "maximum": 5.0,
-    },
-    {
-        "label": "5.00x TO 10.00x",
-        "short": "5.00x-10.00x",
-        "minimum": 5.0,
-        "maximum": 10.0,
-    },
-    {
-        "label": "10.00x TO 25.00x",
-        "short": "10.00x-25.00x",
-        "minimum": 10.0,
-        "maximum": 25.0,
-    },
-    {
-        "label": "25.00x TO 50.00x",
-        "short": "25.00x-50.00x",
-        "minimum": 25.0,
-        "maximum": 50.0,
-    },
-    {
-        "label": "50.00x TO 100.00x",
-        "short": "50.00x-100.00x",
-        "minimum": 50.0,
-        "maximum": 100.0,
-    },
-    {
-        "label": "MORE THAN 100.00x",
-        "short": "100.00x+",
-        "minimum": 100.0,
-        "maximum": None,
-    },
+    make_range_bucket(1.0, 1.1),
+    make_range_bucket(1.1, 1.2),
+    make_range_bucket(1.2, 1.3),
+    make_range_bucket(1.3, 1.5),
+    make_range_bucket(1.5, 1.7),
+    make_range_bucket(1.7, 2.0),
+    make_range_bucket(2.0, 2.5),
+    make_range_bucket(2.5, 3.0),
+    make_range_bucket(3.0, 4.0),
+    make_range_bucket(4.0, 5.0),
+    make_range_bucket(5.0, 7.0),
+    make_range_bucket(7.0, 10.0),
+    make_range_bucket(10.0, 15.0),
+    make_range_bucket(15.0, 25.0),
+    make_range_bucket(25.0, 50.0),
+    make_range_bucket(50.0, 100.0),
+    make_range_bucket(100.0, None),
 ]
+
+
+def bucket_labels_for_range(minimum, maximum):
+    upper_limit = math.inf if maximum is None else maximum
+    labels = []
+
+    for bucket in RANGE_BUCKETS:
+        bucket_maximum = (
+            math.inf
+            if bucket["maximum"] is None
+            else bucket["maximum"]
+        )
+
+        if bucket["minimum"] >= minimum and bucket_maximum <= upper_limit:
+            labels.append(bucket["label"])
+
+    return labels
+
+
+def make_adaptive_candidate(minimum, maximum):
+    label, short = make_range_label(minimum, maximum)
+    return {
+        "label": label,
+        "short": short,
+        "minimum": minimum,
+        "maximum": maximum,
+        "bucket_labels": bucket_labels_for_range(minimum, maximum),
+    }
+
+
 ADAPTIVE_RANGE_CANDIDATES = [
-    {
-        "label": "1.00x TO 1.50x",
-        "short": "1.00x-1.50x",
-        "minimum": 1.0,
-        "maximum": 1.5,
-        "bucket_labels": [
-            "LESS THAN 1.20x",
-            "1.20x TO 1.50x",
-        ],
-    },
-    {
-        "label": "1.00x TO 2.00x",
-        "short": "1.00x-2.00x",
-        "minimum": 1.0,
-        "maximum": 2.0,
-        "bucket_labels": [
-            "LESS THAN 1.20x",
-            "1.20x TO 1.50x",
-            "1.50x TO 2.00x",
-        ],
-    },
-    {
-        "label": "1.20x TO 2.00x",
-        "short": "1.20x-2.00x",
-        "minimum": 1.2,
-        "maximum": 2.0,
-        "bucket_labels": [
-            "1.20x TO 1.50x",
-            "1.50x TO 2.00x",
-        ],
-    },
-    {
-        "label": "1.20x TO 3.00x",
-        "short": "1.20x-3.00x",
-        "minimum": 1.2,
-        "maximum": 3.0,
-        "bucket_labels": [
-            "1.20x TO 1.50x",
-            "1.50x TO 2.00x",
-            "2.00x TO 3.00x",
-        ],
-    },
-    {
-        "label": "1.50x TO 3.00x",
-        "short": "1.50x-3.00x",
-        "minimum": 1.5,
-        "maximum": 3.0,
-        "bucket_labels": [
-            "1.50x TO 2.00x",
-            "2.00x TO 3.00x",
-        ],
-    },
-    {
-        "label": "1.50x TO 5.00x",
-        "short": "1.50x-5.00x",
-        "minimum": 1.5,
-        "maximum": 5.0,
-        "bucket_labels": [
-            "1.50x TO 2.00x",
-            "2.00x TO 3.00x",
-            "3.00x TO 5.00x",
-        ],
-    },
-    {
-        "label": "2.00x TO 5.00x",
-        "short": "2.00x-5.00x",
-        "minimum": 2.0,
-        "maximum": 5.0,
-        "bucket_labels": [
-            "2.00x TO 3.00x",
-            "3.00x TO 5.00x",
-        ],
-    },
-    {
-        "label": "2.00x TO 10.00x",
-        "short": "2.00x-10.00x",
-        "minimum": 2.0,
-        "maximum": 10.0,
-        "bucket_labels": [
-            "2.00x TO 3.00x",
-            "3.00x TO 5.00x",
-            "5.00x TO 10.00x",
-        ],
-    },
-    {
-        "label": "3.00x TO 10.00x",
-        "short": "3.00x-10.00x",
-        "minimum": 3.0,
-        "maximum": 10.0,
-        "bucket_labels": [
-            "3.00x TO 5.00x",
-            "5.00x TO 10.00x",
-        ],
-    },
-    {
-        "label": "5.00x TO 25.00x",
-        "short": "5.00x-25.00x",
-        "minimum": 5.0,
-        "maximum": 25.0,
-        "bucket_labels": [
-            "5.00x TO 10.00x",
-            "10.00x TO 25.00x",
-        ],
-    },
-    {
-        "label": "MORE THAN 10.00x",
-        "short": "10.00x+",
-        "minimum": 10.0,
-        "maximum": None,
-        "bucket_labels": [
-            "10.00x TO 25.00x",
-            "25.00x TO 50.00x",
-            "50.00x TO 100.00x",
-            "MORE THAN 100.00x",
-        ],
-    },
+    make_adaptive_candidate(1.0, 1.2),
+    make_adaptive_candidate(1.0, 1.3),
+    make_adaptive_candidate(1.0, 1.5),
+    make_adaptive_candidate(1.0, 1.7),
+    make_adaptive_candidate(1.0, 2.0),
+    make_adaptive_candidate(1.1, 1.5),
+    make_adaptive_candidate(1.2, 1.7),
+    make_adaptive_candidate(1.2, 2.0),
+    make_adaptive_candidate(1.3, 2.0),
+    make_adaptive_candidate(1.5, 2.5),
+    make_adaptive_candidate(1.5, 3.0),
+    make_adaptive_candidate(1.7, 3.0),
+    make_adaptive_candidate(2.0, 3.0),
+    make_adaptive_candidate(2.0, 4.0),
+    make_adaptive_candidate(2.5, 5.0),
+    make_adaptive_candidate(3.0, 5.0),
+    make_adaptive_candidate(5.0, 10.0),
+    make_adaptive_candidate(10.0, None),
 ]
 PROFILE_WEIGHTS = {
     "balanced": {
-        "overall": 0.35,
-        "recent": 0.25,
-        "pattern": 0.25,
+        "overall": 0.30,
+        "recent": 0.22,
+        "pattern": 0.18,
+        "multi_pattern": 0.18,
         "streak": 0.15,
     },
     "defensive": {
-        "overall": 0.65,
+        "overall": 0.58,
         "recent": 0.15,
         "pattern": 0.10,
+        "multi_pattern": 0.10,
         "streak": 0.10,
     },
     "recent_heavy": {
-        "overall": 0.30,
-        "recent": 0.50,
+        "overall": 0.26,
+        "recent": 0.44,
         "pattern": 0.10,
+        "multi_pattern": 0.10,
         "streak": 0.10,
     },
     "pattern_heavy": {
-        "overall": 0.30,
+        "overall": 0.25,
         "recent": 0.15,
-        "pattern": 0.45,
+        "pattern": 0.32,
+        "multi_pattern": 0.18,
         "streak": 0.10,
     },
     "streak_heavy": {
-        "overall": 0.30,
+        "overall": 0.26,
         "recent": 0.15,
         "pattern": 0.10,
+        "multi_pattern": 0.10,
         "streak": 0.45,
     },
 }
@@ -333,13 +263,13 @@ def select_prediction_rounds(rounds, preferred_source="real", minimum_source_rou
     source_rounds = [
         round_data
         for round_data in rounds
-        if round_data.get("source") == preferred_source
+        if source_label(round_data.get("source", "")) in LIVE_GAME_SOURCES
     ]
     trusted_rounds = [
         round_data
         for round_data in rounds
         if (
-            round_data.get("source") == preferred_source
+            source_label(round_data.get("source", "")) in LIVE_GAME_SOURCES
             or round_data.get("source", "") in LEGACY_SOURCES
         )
     ]
@@ -358,10 +288,21 @@ def select_prediction_rounds(rounds, preferred_source="real", minimum_source_rou
         return trusted_rounds, {
             "mode": "trusted",
             "preferred_source": preferred_source,
+            "combined_sources": sorted(LIVE_GAME_SOURCES),
             "minimum_source_rounds": minimum,
             "using_source_only": False,
             "using_trusted_sources": True,
             "source_rounds": len(source_rounds),
+            "demo_rounds": sum(
+                1
+                for round_data in rounds
+                if source_label(round_data.get("source", "")) == "demo"
+            ),
+            "real_rounds": sum(
+                1
+                for round_data in rounds
+                if source_label(round_data.get("source", "")) == "real"
+            ),
             "legacy_rounds": legacy_round_count,
             "trusted_rounds": len(trusted_rounds),
             "excluded_rounds": excluded_round_count,
@@ -371,15 +312,26 @@ def select_prediction_rounds(rounds, preferred_source="real", minimum_source_rou
 
     if len(source_rounds) >= minimum:
         return source_rounds, {
-            "mode": preferred_source,
+            "mode": "game",
             "preferred_source": preferred_source,
+            "combined_sources": sorted(LIVE_GAME_SOURCES),
             "minimum_source_rounds": minimum,
             "using_source_only": True,
             "using_trusted_sources": False,
             "source_rounds": len(source_rounds),
+            "demo_rounds": sum(
+                1
+                for round_data in rounds
+                if source_label(round_data.get("source", "")) == "demo"
+            ),
+            "real_rounds": sum(
+                1
+                for round_data in rounds
+                if source_label(round_data.get("source", "")) == "real"
+            ),
             "legacy_rounds": legacy_round_count,
             "trusted_rounds": len(source_rounds),
-            "excluded_rounds": len(rounds) - len(source_rounds),
+            "excluded_rounds": excluded_round_count,
             "total_rounds": len(rounds),
             "counts": source_counts(rounds),
         }
@@ -387,10 +339,21 @@ def select_prediction_rounds(rounds, preferred_source="real", minimum_source_rou
     return rounds, {
         "mode": "all",
         "preferred_source": preferred_source,
+        "combined_sources": sorted(LIVE_GAME_SOURCES),
         "minimum_source_rounds": minimum,
         "using_source_only": False,
         "using_trusted_sources": False,
         "source_rounds": len(source_rounds),
+        "demo_rounds": sum(
+            1
+            for round_data in rounds
+            if source_label(round_data.get("source", "")) == "demo"
+        ),
+        "real_rounds": sum(
+            1
+            for round_data in rounds
+            if source_label(round_data.get("source", "")) == "real"
+        ),
         "legacy_rounds": legacy_round_count,
         "trusted_rounds": len(trusted_rounds),
         "excluded_rounds": 0,
@@ -462,10 +425,16 @@ def smoothed_bucket_probabilities(sample, baseline_counts, prior_weight):
     return probabilities
 
 
-def weighted_bucket_probabilities(values, pattern_sample, recent_sample):
+def weighted_bucket_probabilities(
+    values,
+    pattern_sample,
+    recent_sample,
+    multi_pattern_sample=None,
+):
     if not values:
         return []
 
+    multi_pattern_sample = multi_pattern_sample or []
     baseline_counts = Counter(
         range_bucket(value)["label"]
         for value in values
@@ -484,15 +453,28 @@ def weighted_bucket_probabilities(values, pattern_sample, recent_sample):
         baseline_probabilities,
         prior_weight=8,
     )
+    multi_pattern_probabilities = smoothed_bucket_probabilities(
+        multi_pattern_sample,
+        baseline_probabilities,
+        prior_weight=10,
+    )
     probabilities = []
 
     for bucket in RANGE_BUCKETS:
         label = bucket["label"]
-        probability_value = (
-            baseline_probabilities.get(label, 0) * 0.35
-            + recent_probabilities.get(label, 0) * 0.35
-            + pattern_probabilities.get(label, 0) * 0.30
-        )
+        if multi_pattern_sample:
+            probability_value = (
+                baseline_probabilities.get(label, 0) * 0.24
+                + recent_probabilities.get(label, 0) * 0.28
+                + pattern_probabilities.get(label, 0) * 0.18
+                + multi_pattern_probabilities.get(label, 0) * 0.30
+            )
+        else:
+            probability_value = (
+                baseline_probabilities.get(label, 0) * 0.35
+                + recent_probabilities.get(label, 0) * 0.35
+                + pattern_probabilities.get(label, 0) * 0.30
+            )
         probabilities.append(
             {
                 **bucket,
@@ -502,6 +484,38 @@ def weighted_bucket_probabilities(values, pattern_sample, recent_sample):
         )
 
     return probabilities
+
+
+def model_bucket_probabilities(values, sample, prior_weight, model_name):
+    if not values:
+        return []
+
+    baseline_counts = Counter(
+        range_bucket(value)["label"]
+        for value in values
+    )
+    baseline_probabilities = {
+        label: count / len(values)
+        for label, count in baseline_counts.items()
+    }
+
+    if model_name == "baseline":
+        model_probabilities = baseline_probabilities
+    else:
+        model_probabilities = smoothed_bucket_probabilities(
+            sample,
+            baseline_probabilities,
+            prior_weight=prior_weight,
+        )
+
+    return [
+        {
+            **bucket,
+            "probability": model_probabilities.get(bucket["label"], 0),
+            "baseline_probability": baseline_probabilities.get(bucket["label"], 0),
+        }
+        for bucket in RANGE_BUCKETS
+    ]
 
 
 def range_quality(best_bucket, runner_up_bucket, evidence_score):
@@ -541,35 +555,36 @@ def adaptive_range_quality(candidate, evidence_score):
     edge = candidate["probability"] - candidate["baseline_probability"]
     bucket_count = len(candidate["bucket_labels"])
     maximum = candidate.get("maximum")
-    minimum = candidate.get("minimum", 1.0)
+    width = confidence_range_width(
+        candidate.get("minimum", 1.0),
+        maximum,
+    )
 
-    if maximum is not None and maximum > 2.0:
-        return False, "low", "range has not beaten baseline", edge
+    if maximum is None or maximum > ACTIONABLE_RANGE_MAXIMUM:
+        return False, "low", "range too broad for main call", edge
 
-    if minimum > 1.0:
-        return False, "low", "range has not beaten baseline", edge
-
-    if (
-        probability_value >= 0.68
-        and edge >= 0.08
-        and evidence_score >= 0.55
-        and bucket_count <= 3
-    ):
-        return True, "high", "clear wider range", edge
+    if bucket_count > ACTIONABLE_RANGE_MAX_BUCKETS or width > 1.15:
+        return False, "low", "range too broad for main call", edge
 
     if (
-        probability_value >= 0.62
+        probability_value >= 0.50
         and edge >= 0.06
-        and evidence_score >= 0.50
-        and bucket_count <= 3
+        and evidence_score >= 0.55
     ):
-        return True, "medium", "clear wider range", edge
+        return True, "high", "clear compact range", edge
 
-    if probability_value < 0.58:
-        return False, "low", "wider range probability too low", edge
+    if (
+        probability_value >= 0.42
+        and edge >= 0.04
+        and evidence_score >= 0.50
+    ):
+        return True, "medium", "clear compact range", edge
 
-    if edge < 0.06:
-        return False, "low", "wider range has no edge", edge
+    if probability_value < 0.32:
+        return False, "low", "range probability too low", edge
+
+    if edge < 0.025:
+        return False, "low", "range has no edge", edge
 
     return False, "low", "wider range not strong enough", edge
 
@@ -597,10 +612,15 @@ def adaptive_range_estimate(bucket_probabilities, evidence_score):
         )
         edge = probability_value - baseline_probability
         bucket_count = len(labels)
+        width = confidence_range_width(
+            candidate.get("minimum", 1.0),
+            candidate.get("maximum"),
+        )
         score = (
             probability_value
             + max(edge, 0) * 1.5
-            - max(bucket_count - 2, 0) * 0.035
+            - width * 0.16
+            - max(bucket_count - 3, 0) * 0.02
         )
         clear_signal, confidence, clear_reason, quality_edge = adaptive_range_quality(
             {
@@ -629,17 +649,255 @@ def adaptive_range_estimate(bucket_probabilities, evidence_score):
     )
 
 
-def next_range_estimate(values, pattern_sample, recent_sample):
-    if not values:
+def confidence_range_label(minimum, maximum):
+    if maximum is None:
+        return (
+            f"MORE THAN {minimum:.2f}x",
+            f"{minimum:.2f}x+",
+        )
+
+    return (
+        f"{minimum:.2f}x TO {maximum:.2f}x",
+        f"{minimum:.2f}x-{maximum:.2f}x",
+    )
+
+
+def confidence_range_width(minimum, maximum):
+    if maximum is None:
+        return 12
+
+    return math.log(
+        max(maximum / max(minimum, 1), 1.01),
+        2,
+    )
+
+
+def confidence_range_quality(candidate, evidence_score):
+    probability_value = candidate["probability"]
+    edge = probability_value - candidate["baseline_probability"]
+    bucket_count = len(candidate["bucket_labels"])
+    maximum = candidate.get("maximum")
+
+    if maximum is None or maximum > ACTIONABLE_RANGE_MAXIMUM:
+        return False, "low", "coverage range too broad for main call", edge
+
+    if bucket_count > ACTIONABLE_RANGE_MAX_BUCKETS:
+        return False, "low", "coverage range too broad for main call", edge
+
+    if (
+        probability_value >= CONFIDENCE_RANGE_TARGET
+        and edge >= CONFIDENCE_RANGE_MIN_EDGE + 0.01
+        and evidence_score >= 0.55
+        and maximum is not None
+        and maximum <= ACTIONABLE_RANGE_MAXIMUM
+        and bucket_count <= ACTIONABLE_RANGE_MAX_BUCKETS
+    ):
+        return True, "high", "useful confidence range", edge
+
+    if (
+        probability_value >= CONFIDENCE_RANGE_TARGET
+        and edge >= CONFIDENCE_RANGE_MIN_EDGE
+        and evidence_score >= 0.45
+        and maximum is not None
+        and maximum <= ACTIONABLE_RANGE_MAXIMUM
+        and bucket_count <= ACTIONABLE_RANGE_MAX_BUCKETS
+    ):
+        return True, "medium", "useful confidence range", edge
+
+    if probability_value < CONFIDENCE_RANGE_TARGET:
+        return False, "low", "below confidence target", edge
+
+    if maximum is None or maximum > CONFIDENCE_RANGE_MAXIMUM:
+        return False, "low", "confidence range too wide", edge
+
+    if edge < CONFIDENCE_RANGE_MIN_EDGE:
+        return False, "low", "confidence range not beating baseline", edge
+
+    if evidence_score < 0.45:
+        return False, "low", "not enough evidence for confidence range", edge
+
+    if bucket_count > CONFIDENCE_RANGE_MAX_BUCKETS:
+        return False, "low", "confidence range too broad", edge
+
+    return False, "low", "confidence range not strong enough", edge
+
+
+def recommended_cashout_for_range(candidate, sorted_sample):
+    maximum = candidate.get("maximum")
+    minimum = candidate.get("minimum", 1.0)
+    median = percentile(sorted_sample, 0.50)
+    p40 = percentile(sorted_sample, 0.40)
+    base = p40 if p40 is not None else median
+
+    if base is None:
+        base = minimum
+
+    target = max(1.05, float(base) * 0.9)
+
+    if maximum is not None:
+        target = min(target, maximum * 0.78)
+
+    if minimum > 1.0:
+        target = max(target, minimum * 0.95)
+
+    return round(max(1.01, target), 2)
+
+
+def confidence_range_estimate(bucket_probabilities, evidence_score, sorted_sample):
+    candidates = []
+
+    for start_index in range(len(bucket_probabilities)):
+        for end_index in range(start_index, len(bucket_probabilities)):
+            selected_buckets = bucket_probabilities[start_index:end_index + 1]
+            minimum = selected_buckets[0]["minimum"]
+            maximum = selected_buckets[-1]["maximum"]
+            labels = [
+                bucket["label"]
+                for bucket in selected_buckets
+            ]
+            probability_value = sum(
+                bucket["probability"]
+                for bucket in selected_buckets
+            )
+            baseline_probability = sum(
+                bucket["baseline_probability"]
+                for bucket in selected_buckets
+            )
+            label, short = confidence_range_label(
+                minimum,
+                maximum,
+            )
+            width = confidence_range_width(
+                minimum,
+                maximum,
+            )
+            target_gap = abs(
+                probability_value - CONFIDENCE_RANGE_TARGET
+            )
+            edge = probability_value - baseline_probability
+            bucket_count = len(selected_buckets)
+            score = (
+                target_gap * 4.0
+                + width * 0.22
+                + bucket_count * 0.035
+                - max(edge, 0) * 1.4
+            )
+            candidate = {
+                "label": label,
+                "short": short,
+                "minimum": minimum,
+                "maximum": maximum,
+                "bucket_labels": labels,
+                "probability": probability_value,
+                "baseline_probability": baseline_probability,
+                "score": score,
+                "coverage_gap": probability_value - CONFIDENCE_RANGE_TARGET,
+                "target_confidence": CONFIDENCE_RANGE_TARGET,
+                "bucket_count": bucket_count,
+            }
+            clear_signal, confidence, clear_reason, quality_edge = confidence_range_quality(
+                candidate,
+                evidence_score,
+            )
+            candidate.update(
+                {
+                    "clear_signal": clear_signal,
+                    "confidence": confidence,
+                    "clear_reason": clear_reason,
+                    "edge": quality_edge,
+                }
+            )
+            candidate["cashout_target"] = recommended_cashout_for_range(
+                candidate,
+                sorted_sample,
+            )
+            candidates.append(
+                candidate
+            )
+
+    allowed_candidates = [
+        candidate
+        for candidate in candidates
+        if (
+            candidate["maximum"] is not None
+            and candidate["maximum"] <= CONFIDENCE_RANGE_MAXIMUM
+            and candidate["bucket_count"] <= CONFIDENCE_RANGE_MAX_BUCKETS
+        )
+    ]
+    near_target_candidates = [
+        candidate
+        for candidate in allowed_candidates
+        if candidate["probability"] >= CONFIDENCE_RANGE_NEAR_TARGET
+    ]
+    pool = near_target_candidates or allowed_candidates or candidates
+
+    return min(
+        pool,
+        key=lambda item: item["score"],
+    )
+
+
+def compact_coverage_range(candidate):
+    if not candidate:
         return None
 
-    range_sample = pattern_sample if len(pattern_sample) >= 8 else recent_sample
-    sorted_sample = sorted(range_sample or values)
-    bucket_probabilities = weighted_bucket_probabilities(
-        values,
-        pattern_sample,
-        recent_sample,
+    return {
+        "label": candidate["label"],
+        "short": candidate["short"],
+        "minimum": candidate["minimum"],
+        "maximum": candidate["maximum"],
+        "probability": candidate["probability"],
+        "baseline_probability": candidate["baseline_probability"],
+        "range_type": "confidence_80",
+        "confidence": candidate["confidence"],
+        "clear_signal": candidate["clear_signal"],
+        "clear_reason": candidate["clear_reason"],
+        "edge": candidate["edge"],
+        "target_confidence": candidate.get("target_confidence"),
+        "cashout_target": candidate.get("cashout_target"),
+        "coverage_gap": candidate.get("coverage_gap"),
+        "bucket_count": candidate.get("bucket_count"),
+    }
+
+
+def compact_model_candidate(candidate):
+    if not candidate:
+        return None
+
+    keys = (
+        "candidate_model",
+        "label",
+        "short",
+        "minimum",
+        "maximum",
+        "probability",
+        "baseline_probability",
+        "confidence",
+        "source",
+        "range_type",
+        "clear_signal",
+        "clear_reason",
+        "edge",
+        "target_confidence",
+        "cashout_target",
+        "coverage_gap",
+        "bucket_count",
+        "sample_size",
     )
+    return {
+        key: candidate.get(key)
+        for key in keys
+    }
+
+
+def range_estimate_from_bucket_probabilities(
+    bucket_probabilities,
+    range_sample,
+    fallback_values,
+    evidence_score,
+    source,
+    candidate_model,
+):
     best_bucket = max(
         bucket_probabilities,
         key=lambda item: item["probability"],
@@ -650,19 +908,20 @@ def next_range_estimate(values, pattern_sample, recent_sample):
         reverse=True,
     )
     runner_up_bucket = ordered_buckets[1] if len(ordered_buckets) > 1 else None
-    confidence_score = (
-        0.55 * clamp(len(pattern_sample) / 25, 0, 1)
-        + 0.25 * clamp(len(recent_sample) / RECENT_WINDOW, 0, 1)
-        + 0.20 * best_bucket["probability"]
-    )
+    sorted_sample = sorted(range_sample or fallback_values)
     clear_signal, confidence, clear_reason, edge = range_quality(
         best_bucket,
         runner_up_bucket,
-        confidence_score,
+        evidence_score,
     )
     adaptive = adaptive_range_estimate(
         bucket_probabilities,
-        confidence_score,
+        evidence_score,
+    )
+    confidence_range = confidence_range_estimate(
+        bucket_probabilities,
+        evidence_score,
+        sorted_sample,
     )
 
     if not clear_signal and adaptive["probability"] >= best_bucket["probability"] + 0.15:
@@ -671,6 +930,17 @@ def next_range_estimate(values, pattern_sample, recent_sample):
         confidence = adaptive["confidence"]
         clear_reason = adaptive["clear_reason"]
         edge = adaptive["edge"]
+
+    coverage_range = compact_coverage_range(
+        confidence_range
+    )
+
+    if confidence_range and confidence_range["clear_signal"]:
+        best_bucket = confidence_range
+        clear_signal = confidence_range["clear_signal"]
+        confidence = confidence_range["confidence"]
+        clear_reason = confidence_range["clear_reason"]
+        edge = confidence_range["edge"]
 
     return {
         "label": best_bucket["label"],
@@ -682,13 +952,25 @@ def next_range_estimate(values, pattern_sample, recent_sample):
         "low": percentile(sorted_sample, 0.25),
         "median": percentile(sorted_sample, 0.50),
         "high": percentile(sorted_sample, 0.75),
-        "sample_size": len(range_sample or values),
-        "source": "pattern" if len(pattern_sample) >= 8 else "recent",
-        "range_type": "adaptive" if "bucket_labels" in best_bucket else "narrow",
+        "sample_size": len(range_sample or fallback_values),
+        "source": source,
+        "candidate_model": candidate_model,
+        "range_type": (
+            "confidence_80"
+            if best_bucket.get("target_confidence")
+            else "adaptive"
+            if "bucket_labels" in best_bucket
+            else "narrow"
+        ),
         "confidence": confidence,
         "clear_signal": clear_signal,
         "clear_reason": clear_reason,
         "edge": edge,
+        "target_confidence": best_bucket.get("target_confidence"),
+        "cashout_target": best_bucket.get("cashout_target"),
+        "coverage_gap": best_bucket.get("coverage_gap"),
+        "bucket_count": best_bucket.get("bucket_count"),
+        "coverage_range": coverage_range,
         "runner_up_label": runner_up_bucket["label"] if runner_up_bucket else "",
         "runner_up_probability": (
             runner_up_bucket["probability"]
@@ -697,6 +979,165 @@ def next_range_estimate(values, pattern_sample, recent_sample):
         ),
         "buckets": bucket_probabilities,
     }
+
+
+def range_candidate_evidence(bucket_probabilities, sample_size, source):
+    best_probability = max(
+        (
+            item["probability"]
+            for item in bucket_probabilities
+        ),
+        default=0,
+    )
+
+    if source == "pattern":
+        return (
+            0.70 * clamp(sample_size / 40, 0, 1)
+            + 0.30 * best_probability
+        )
+
+    if source == "multi_pattern":
+        return (
+            0.68 * clamp(sample_size / MULTI_PATTERN_MATCH_LIMIT, 0, 1)
+            + 0.32 * best_probability
+        )
+
+    if source == "recent":
+        return (
+            0.65 * clamp(sample_size / RECENT_WINDOW, 0, 1)
+            + 0.35 * best_probability
+        )
+
+    if source == "baseline":
+        return (
+            0.45 * clamp(sample_size / 500, 0, 1)
+            + 0.15 * best_probability
+        )
+
+    return (
+        0.55 * clamp(sample_size / 25, 0, 1)
+        + 0.25
+        + 0.20 * best_probability
+    )
+
+
+def next_range_estimate(
+    values,
+    pattern_sample,
+    recent_sample,
+    multi_pattern_sample=None,
+):
+    if not values:
+        return None
+
+    multi_pattern_sample = multi_pattern_sample or []
+
+    if len(pattern_sample) >= 8:
+        range_sample = pattern_sample
+        source = "pattern"
+    elif len(multi_pattern_sample) >= 18:
+        range_sample = multi_pattern_sample
+        source = "multi_pattern"
+    else:
+        range_sample = recent_sample
+        source = "recent"
+
+    bucket_probabilities = weighted_bucket_probabilities(
+        values,
+        pattern_sample,
+        recent_sample,
+        multi_pattern_sample,
+    )
+    confidence_score = range_candidate_evidence(
+        bucket_probabilities,
+        len(range_sample),
+        source,
+    )
+    estimate = range_estimate_from_bucket_probabilities(
+        bucket_probabilities,
+        range_sample,
+        values,
+        confidence_score,
+        source,
+        "ensemble",
+    )
+    candidate_specs = [
+        (
+            "baseline",
+            model_bucket_probabilities(
+                values,
+                values,
+                0,
+                "baseline",
+            ),
+            values,
+            "baseline",
+        ),
+        (
+            "recent",
+            model_bucket_probabilities(
+                values,
+                recent_sample,
+                12,
+                "recent",
+            ),
+            recent_sample,
+            "recent",
+        ),
+        (
+            "pattern",
+            model_bucket_probabilities(
+                values,
+                pattern_sample,
+                8,
+                "pattern",
+            ),
+            pattern_sample,
+            "pattern",
+        ),
+        (
+            "multi_pattern",
+            model_bucket_probabilities(
+                values,
+                multi_pattern_sample,
+                10,
+                "multi_pattern",
+            ),
+            multi_pattern_sample,
+            "multi_pattern",
+        ),
+        (
+            "ensemble",
+            bucket_probabilities,
+            range_sample,
+            source,
+        ),
+    ]
+    model_candidates = []
+
+    for candidate_model, probabilities, sample, candidate_source in candidate_specs:
+        if not probabilities:
+            continue
+
+        candidate_evidence = range_candidate_evidence(
+            probabilities,
+            len(sample),
+            candidate_source,
+        )
+        candidate = range_estimate_from_bucket_probabilities(
+            probabilities,
+            sample,
+            values,
+            candidate_evidence,
+            candidate_source,
+            candidate_model,
+        )
+        model_candidates.append(
+            compact_model_candidate(candidate)
+        )
+
+    estimate["model_candidates"] = model_candidates
+    return estimate
 
 
 def summarize(values):
@@ -777,6 +1218,43 @@ def pattern_matches(values, lookback):
     return {
         "pattern": latest_pattern,
         "matches": matches,
+    }
+
+
+def multi_lookback_matches(values, active_lookback):
+    lookbacks = sorted(
+        {
+            lookback
+            for lookback in (
+                [active_lookback]
+                + MULTI_PATTERN_LOOKBACKS
+                + [active_lookback + 1]
+            )
+            if lookback >= 1
+        }
+    )
+    matches = []
+    details = []
+
+    for lookback in lookbacks:
+        match_data = pattern_matches(values, lookback)
+        lookback_matches = match_data["matches"][-MULTI_PATTERN_MATCH_LIMIT:]
+
+        if lookback_matches:
+            matches.extend(lookback_matches)
+
+        details.append(
+            {
+                "lookback": lookback,
+                "pattern": match_data["pattern"],
+                "matches": len(match_data["matches"]),
+            }
+        )
+
+    return {
+        "lookbacks": lookbacks,
+        "details": details,
+        "matches": matches[-MULTI_PATTERN_MATCH_LIMIT:],
     }
 
 
@@ -877,6 +1355,7 @@ def clear_signal_label(
 
     if (
         evidence["pattern_matches"] < 8
+        and evidence.get("multi_pattern_matches", 0) < 24
         and evidence["streak_matches"] < 20
         and evidence["recent_rounds"] < 60
     ):
@@ -946,8 +1425,9 @@ def blend_components(components, profile_name):
     if total <= 0:
         return components["overall"]
 
+    baseline = components.get("overall", 0)
     return sum(
-        components[name] * weight
+        components.get(name, baseline) * weight
         for name, weight in weights.items()
     ) / total
 
@@ -956,6 +1436,8 @@ def next_round_prediction(values, lookback, targets, calibration=None):
     calibration = calibration or {}
     match_data = pattern_matches(values, lookback)
     pattern_sample = match_data["matches"]
+    multi_match_data = multi_lookback_matches(values, lookback)
+    multi_pattern_sample = multi_match_data["matches"]
     recent_sample = values[-RECENT_WINDOW:]
 
     predictions = []
@@ -985,6 +1467,12 @@ def next_round_prediction(values, lookback, targets, calibration=None):
             baseline,
             prior_weight=8,
         )
+        multi_pattern = smoothed_probability(
+            multi_pattern_sample,
+            target,
+            baseline,
+            prior_weight=10,
+        )
         streak_data = streak_matches(values, target)
         streak_sample = streak_data["matches"]
         streak = smoothed_probability(
@@ -998,6 +1486,7 @@ def next_round_prediction(values, lookback, targets, calibration=None):
             "overall": baseline,
             "recent": recent,
             "pattern": pattern,
+            "multi_pattern": multi_pattern,
             "streak": streak,
         }
         raw_ensemble = blend_components(
@@ -1011,9 +1500,10 @@ def next_round_prediction(values, lookback, targets, calibration=None):
         )
 
         evidence_score = (
-            0.45 * clamp(len(pattern_sample) / 25, 0, 1)
+            0.30 * clamp(len(pattern_sample) / 25, 0, 1)
+            + 0.18 * clamp(len(multi_pattern_sample) / 80, 0, 1)
             + 0.30 * clamp(len(streak_sample) / 35, 0, 1)
-            + 0.25 * clamp(len(values) / 500, 0, 1)
+            + 0.22 * clamp(len(values) / 500, 0, 1)
         )
         confidence = confidence_label(evidence_score)
         signal = signal_label(
@@ -1036,6 +1526,8 @@ def next_round_prediction(values, lookback, targets, calibration=None):
         evidence = {
             "recent_rounds": len(recent_sample),
             "pattern_matches": len(pattern_sample),
+            "multi_pattern_matches": len(multi_pattern_sample),
+            "multi_pattern_lookbacks": multi_match_data["details"],
             "below_target_streak": streak_data["streak"],
             "streak_matches": len(streak_sample),
         }
@@ -1106,6 +1598,7 @@ def next_round_prediction(values, lookback, targets, calibration=None):
             values,
             pattern_sample,
             recent_sample,
+            multi_pattern_sample,
         ),
         "predictions": predictions,
     }
@@ -1239,16 +1732,16 @@ def print_report(report):
         if data_selection.get("using_trusted_sources"):
             data_mode = (
                 "trusted "
-                f"({data_selection.get('trusted_rounds', 0)} real+legacy / "
+                f"({data_selection.get('trusted_rounds', 0)} game+legacy / "
                 f"{data_selection.get('total_rounds', summary['rounds'])} total; "
                 f"excluded {data_selection.get('excluded_rounds', 0)})"
             )
         else:
             data_mode = (
                 f"{data_selection.get('mode', 'all')} "
-                f"({data_selection.get('source_rounds', 0)} real / "
+                f"({data_selection.get('source_rounds', 0)} game / "
                 f"{data_selection.get('total_rounds', summary['rounds'])} total; "
-                f"switch at {data_selection.get('minimum_source_rounds', 0)} real)"
+                f"switch at {data_selection.get('minimum_source_rounds', 0)} game)"
             )
 
         print(

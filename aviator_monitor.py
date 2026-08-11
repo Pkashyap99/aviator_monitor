@@ -79,9 +79,9 @@ ROUND_CONTEXT_HEADERS = [
     "context_hash",
 ]
 
-MAX_NEW_VALUES_PER_SCAN = 8
+MAX_NEW_VALUES_PER_SCAN = 150
 
-MAX_STARTUP_RECOVERY_VALUES = 20
+MAX_STARTUP_RECOVERY_VALUES = 150
 
 MAX_ROUNDS_BACKUPS = 30
 
@@ -1517,21 +1517,17 @@ def save_state(snapshot):
 # =========================================================
 
 def normalize_selector_config(selector):
-    selectors = []
+    selectors = [
+        ".px-1 > .text-w-60",
+        ".bottom-odds-history .text-w-60",
+        ".px-1 .text-w-60",
+        ".bottom-odds-history",
+    ]
 
     if isinstance(selector, list):
         selectors.extend(selector)
     else:
         selectors.append(selector)
-
-    # Prefer the small history chips. Broad parent selectors can read the full
-    # history panel as one block and create false duplicate rounds.
-    selectors.extend(
-        [
-            ".px-1 > .text-w-60",
-            ".px-1 .text-w-60",
-        ]
-    )
 
     normalized = []
 
@@ -1544,47 +1540,64 @@ def normalize_selector_config(selector):
 
 async def read_multipliers_once(page, selector):
 
-    elements = await page.locator(selector).all()
+    texts = await page.evaluate(
+        """
+        selector => {
+          const output = [];
+          const nodes = Array.from(document.querySelectorAll(selector));
+
+          for (const node of nodes) {
+            const rect = node.getBoundingClientRect();
+            const style = window.getComputedStyle(node);
+
+            if (
+              rect.width <= 0
+              || rect.height <= 0
+              || style.visibility === "hidden"
+              || style.display === "none"
+            ) {
+              continue;
+            }
+
+            output.push(
+              (node.innerText || node.textContent || "").trim()
+            );
+          }
+
+          return output;
+        }
+        """,
+        selector
+    )
 
     values = []
 
-    for element in elements:
+    for text in texts:
 
-        try:
+        for piece in re.split(r"\s+", str(text).strip()):
 
-            if not await element.is_visible():
+            match = MULTIPLIER_RE.search(piece)
+
+            if not match:
                 continue
 
-            text = (
-                await element.inner_text()
-            ).strip()
+            try:
 
-        except Exception:
-
-            continue
-
-        match = MULTIPLIER_RE.search(text)
-
-        if not match:
-            continue
-
-        try:
-
-            value = float(
-                match.group(1)
-            )
-
-            # Basic sanity protection
-            if value >= 1:
-                values.append(
-                    round(
-                        value,
-                        2
-                    )
+                value = float(
+                    match.group(1)
                 )
 
-        except ValueError:
-            continue
+                # Basic sanity protection
+                if value >= 1:
+                    values.append(
+                        round(
+                            value,
+                            2
+                        )
+                    )
+
+            except ValueError:
+                continue
 
     return values
 
@@ -2133,25 +2146,29 @@ async def install_history_watcher(
                 }
 
                 const text = (node.innerText || node.textContent || "").trim();
-                const match = text.match(/^(\\d+(?:\\.\\d+)?)(?:x)?$/i);
+                const parts = text.split(/\\s+/).filter(Boolean);
 
-                if (!match) {
-                  continue;
+                for (const part of parts) {
+                  const match = part.match(/^(\\d+(?:\\.\\d+)?)(?:x)?$/i);
+
+                  if (!match) {
+                    continue;
+                  }
+
+                  const value = Number.parseFloat(match[1]);
+
+                  if (!Number.isFinite(value) || value < 1) {
+                    continue;
+                  }
+
+                  const rounded = Math.round(value * 100) / 100;
+                  const key = `${seen.size}:${rounded}`;
+                  seen.add(key);
+                  values.push({
+                    value: rounded,
+                    roundId: extractRoundId(node),
+                  });
                 }
-
-                const value = Number.parseFloat(match[1]);
-
-                if (!Number.isFinite(value) || value < 1) {
-                  continue;
-                }
-
-                const rounded = Math.round(value * 100) / 100;
-                const key = `${seen.size}:${rounded}`;
-                seen.add(key);
-                values.push({
-                  value: rounded,
-                  roundId: extractRoundId(node),
-                });
               }
 
               if (values.length) {
@@ -3167,6 +3184,21 @@ def page_source(page_url):
     return "unknown"
 
 
+def source_matches_required(current_source, required_source):
+    if not required_source:
+        return True
+
+    normalized = str(required_source).strip().lower()
+
+    if normalized in ("game", "any", "all"):
+        return current_source in ("real", "demo", "unknown")
+
+    if normalized in ("live", "real_or_demo", "demo_or_real"):
+        return current_source in ("real", "demo")
+
+    return current_source == normalized
+
+
 async def find_aviatrix_page(browser, preferred_url=None, required_source=None):
 
     if not browser.contexts:
@@ -3191,7 +3223,10 @@ async def find_aviatrix_page(browser, preferred_url=None, required_source=None):
                 page.url,
                 preferred_url
             ):
-                if required_source and page_source(page.url) != required_source:
+                if not source_matches_required(
+                    page_source(page.url),
+                    required_source
+                ):
                     continue
 
                 return page
@@ -3209,7 +3244,10 @@ async def find_aviatrix_page(browser, preferred_url=None, required_source=None):
             if page_is_real_aviatrix(
                 page.url
             ):
-                if required_source and page_source(page.url) != required_source:
+                if not source_matches_required(
+                    page_source(page.url),
+                    required_source
+                ):
                     continue
 
                 return page
@@ -3234,8 +3272,13 @@ async def find_aviatrix_page(browser, preferred_url=None, required_source=None):
                 "aviatrix" in title
                 or
                 "game.aviatrix.bet" in url
+                or
+                "demo.aviatrix.bet" in url
             ):
-                if required_source and page_source(page.url) != required_source:
+                if not source_matches_required(
+                    page_source(page.url),
+                    required_source
+                ):
                     continue
 
                 return page
@@ -3403,7 +3446,10 @@ async def monitor_page(
         page.url
     )
 
-    if required_source and current_source != required_source:
+    if not source_matches_required(
+        current_source,
+        required_source
+    ):
 
         raise RuntimeError(
             "Required round source is "
@@ -3593,7 +3639,10 @@ async def monitor_page(
                 page.url
             )
 
-            if required_source and live_source != required_source:
+            if not source_matches_required(
+                live_source,
+                required_source
+            ):
 
                 log(
                     "WARNING: Required round source changed from "
@@ -4041,9 +4090,14 @@ async def main():
                         "Required Aviatrix tab not found."
                     )
 
+                    source_hint = (
+                        "Open any Aviatrix game tab, demo or real, in the debug Chrome window."
+                        if required_source in ("game", "any", "all", "live", "real_or_demo", "demo_or_real")
+                        else "Open the main real Aviatrix game tab (game.aviatrix.bet with isDemo=false) in the debug Chrome window."
+                    )
+
                     log(
-                        "Open the main real Aviatrix game tab "
-                        "(game.aviatrix.bet with isDemo=false) in the debug Chrome window."
+                        source_hint
                     )
 
                     await asyncio.sleep(

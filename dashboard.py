@@ -28,10 +28,13 @@ CONFIG_PATH = ROOT / "config.json"
 PREDICTION_STATE_PATH = DATA_DIR / "prediction_state.json"
 PREDICTION_HISTORY_PATH = DATA_DIR / "prediction_history.csv"
 RANGE_PREDICTION_HISTORY_PATH = DATA_DIR / "range_prediction_history.csv"
+RANGE_MODEL_HISTORY_PATH = DATA_DIR / "range_model_history.csv"
 ROUND_CONTEXT_PATH = DATA_DIR / "round_context.csv"
-RANGE_MODEL_VERSION = "adaptive-v4"
+RANGE_MODEL_VERSION = "adaptive-v8-fine-multilookback"
 DASHBOARD_DIR = ROOT / "dashboard"
-TRACKED_TARGETS = [1.5, 2.0, 3.0, 5.0, 10.0, 25.0, 50.0, 100.0]
+TRACKED_TARGETS = [1.5, 2.0, 3.0, 5.0, 10.0, 20.0, 25.0, 50.0, 100.0]
+BIG_MULTIPLIER_TARGETS = [10.0, 20.0, 50.0, 100.0]
+BIG_MULTIPLIER_RECENT_LIMIT = 8
 TRACKING_LOCK = threading.Lock()
 BACKTEST_LOCK = threading.Lock()
 DISPLAY_MONEY_LOCK = threading.Lock()
@@ -45,6 +48,9 @@ BACKTEST_REFRESH_SECONDS = 20
 PARTICIPANT_CONTEXT_LIVE_SECONDS = 5
 RECENT_CONTEXT_MAX_ROWS = 2500
 RECENT_CONTEXT_MAX_BYTES = 1024 * 1024
+ACTIONABLE_LEADERBOARD_MAXIMUM = 3.0
+MIN_LEADERBOARD_CHECKED = 30
+MIN_LEADERBOARD_ACCURACY = 0.56
 BACKTEST_CACHE = {
     "key": None,
     "generated_at": 0,
@@ -63,6 +69,7 @@ DISPLAY_MONEY_FIELDS = {
     "max_bet": "display_max_bet",
     "total_win": "display_total_win",
     "max_win": "display_max_win",
+    "net_result": "display_net_result",
 }
 DEFAULT_DISPLAY_CURRENCY = "INR"
 DEFAULT_EUR_TO_INR_RATE = 100.0
@@ -134,6 +141,82 @@ def ingest_status(rounds):
         "last_round_timestamp": last_timestamp,
         "last_round_age_seconds": age_seconds,
         "is_stale": age_seconds > 180,
+    }
+
+
+def compact_round_event(round_data, round_number, total_rounds, threshold=None):
+    return {
+        "timestamp": round_data.get("timestamp", ""),
+        "multiplier": round_float(round_data.get("multiplier")),
+        "round_id": round_data.get("round_id", ""),
+        "source": round_data.get("source", ""),
+        "round_number": round_number,
+        "rounds_ago": max(0, total_rounds - round_number),
+        "threshold": threshold,
+    }
+
+
+def big_round_watch(rounds):
+    total_rounds = len(rounds)
+    thresholds = []
+    recent_events = []
+
+    for target in BIG_MULTIPLIER_TARGETS:
+        hits = []
+
+        for index, round_data in enumerate(rounds):
+            multiplier = round_data.get("multiplier")
+
+            if multiplier is not None and multiplier >= target:
+                hits.append((index + 1, round_data))
+
+        last_hit = hits[-1] if hits else None
+        thresholds.append(
+            {
+                "target": target,
+                "count": len(hits),
+                "rate": (len(hits) / total_rounds) if total_rounds else None,
+                "last": (
+                    compact_round_event(
+                        last_hit[1],
+                        last_hit[0],
+                        total_rounds,
+                        threshold=target,
+                    )
+                    if last_hit
+                    else None
+                ),
+            }
+        )
+
+    for index, round_data in enumerate(rounds):
+        multiplier = round_data.get("multiplier")
+
+        if multiplier is None or multiplier < BIG_MULTIPLIER_TARGETS[0]:
+            continue
+
+        threshold = max(
+            target for target in BIG_MULTIPLIER_TARGETS if multiplier >= target
+        )
+        recent_events.append(
+            compact_round_event(
+                round_data,
+                index + 1,
+                total_rounds,
+                threshold=threshold,
+            )
+        )
+
+    recent_events = recent_events[-BIG_MULTIPLIER_RECENT_LIMIT:]
+    recent_events.reverse()
+    latest = recent_events[0] if recent_events else None
+
+    return {
+        "targets": BIG_MULTIPLIER_TARGETS,
+        "latest": latest,
+        "current_round_big": bool(latest and latest.get("rounds_ago") == 0),
+        "recent": recent_events,
+        "thresholds": thresholds,
     }
 
 
@@ -463,6 +546,14 @@ def context_from_row(row):
             row.get("payload_records")
         ),
     }
+    context["net_result"] = (
+        context["total_win"] - context["total_bet"]
+        if (
+            context.get("total_win") is not None
+            and context.get("total_bet") is not None
+        )
+        else None
+    )
 
     return decorate_context_display_money(
         update_round_context_age(
@@ -959,6 +1050,67 @@ def append_range_prediction_result(row):
         writer.writerow(row)
 
 
+def ensure_range_model_history():
+    DATA_DIR.mkdir(exist_ok=True)
+    headers = [
+        "checked_at",
+        "predicted_at",
+        "predicted_after_round_count",
+        "actual_round_count",
+        "actual_timestamp",
+        "model_version",
+        "candidate_model",
+        "predicted_label",
+        "minimum",
+        "maximum",
+        "probability",
+        "confidence",
+        "source",
+        "range_type",
+        "clear_signal",
+        "clear_reason",
+        "scored",
+        "actual_multiplier",
+        "correct",
+    ]
+
+    if RANGE_MODEL_HISTORY_PATH.exists():
+        with RANGE_MODEL_HISTORY_PATH.open("r", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            fieldnames = reader.fieldnames or []
+
+            if all(header in fieldnames for header in headers):
+                return
+
+            rows = list(reader)
+
+        with RANGE_MODEL_HISTORY_PATH.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=headers)
+            writer.writeheader()
+
+            for row in rows:
+                writer.writerow(
+                    {
+                        header: row.get(header, "")
+                        for header in headers
+                    }
+                )
+
+        return
+
+    with RANGE_MODEL_HISTORY_PATH.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(headers)
+
+
+def append_range_model_result(row):
+    ensure_range_model_history()
+
+    with RANGE_MODEL_HISTORY_PATH.open("a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(row)
+
+
 def rolling_accuracy(results):
     if not results:
         return None
@@ -985,6 +1137,16 @@ def range_prediction_history_rows():
 
     try:
         with RANGE_PREDICTION_HISTORY_PATH.open("r", newline="", encoding="utf-8") as f:
+            return list(csv.DictReader(f))
+    except OSError:
+        return []
+
+
+def range_model_history_rows():
+    ensure_range_model_history()
+
+    try:
+        with RANGE_MODEL_HISTORY_PATH.open("r", newline="", encoding="utf-8") as f:
             return list(csv.DictReader(f))
     except OSError:
         return []
@@ -1029,9 +1191,96 @@ def accuracy_for_rows(rows):
     }
 
 
+def build_range_model_leaderboard():
+    rows = [
+        row
+        for row in range_model_history_rows()
+        if (
+            row.get("model_version") == RANGE_MODEL_VERSION
+            and parse_bool_int(row.get("scored", "0"))
+        )
+    ]
+    by_model = {}
+
+    for row in rows:
+        model_name = row.get("candidate_model", "") or "unknown"
+        by_model.setdefault(model_name, []).append(row)
+
+    leaderboard = []
+
+    for model_name, model_rows in by_model.items():
+        recent_rows = model_rows[-100:]
+        stats = accuracy_for_rows(recent_rows)
+        all_stats = accuracy_for_rows(model_rows[-300:])
+        leaderboard.append(
+            {
+                "candidate_model": model_name,
+                "checked": stats["checked"],
+                "correct": stats["correct"],
+                "accuracy": stats["accuracy"],
+                "long_checked": all_stats["checked"],
+                "long_accuracy": all_stats["accuracy"],
+            }
+        )
+
+    leaderboard.sort(
+        key=lambda item: (
+            item["accuracy"] if item["accuracy"] is not None else -1,
+            item["checked"],
+        ),
+        reverse=True,
+    )
+    active = None
+
+    for item in leaderboard:
+        if (
+            item.get("checked", 0) >= MIN_LEADERBOARD_CHECKED
+            and item.get("accuracy") is not None
+            and item["accuracy"] >= MIN_LEADERBOARD_ACCURACY
+        ):
+            active = item
+            break
+
+    return {
+        "items": leaderboard,
+        "active": active,
+    }
+
+
+def build_self_learning_status(range_leaderboard):
+    items = range_leaderboard.get("items", [])
+    active = range_leaderboard.get("active")
+    best = items[0] if items else None
+    checked = max(
+        (
+            int(item.get("checked", 0))
+            for item in items
+        ),
+        default=0,
+    )
+    remaining = max(
+        0,
+        MIN_LEADERBOARD_CHECKED - checked,
+    )
+
+    return {
+        "enabled": True,
+        "updates_after_each_round": True,
+        "status": "active" if active else "learning",
+        "active_model": active,
+        "best_model": best,
+        "models_tracked": len(items),
+        "scored_rounds": checked,
+        "minimum_scored_rounds": MIN_LEADERBOARD_CHECKED,
+        "rounds_until_auto_select": remaining,
+        "minimum_accuracy": MIN_LEADERBOARD_ACCURACY,
+    }
+
+
 def build_accuracy_summary():
     rows = prediction_history_rows()
     range_rows = range_prediction_history_rows()
+    range_leaderboard = build_range_model_leaderboard()
     current_range_rows = [
         row
         for row in range_rows
@@ -1096,6 +1345,11 @@ def build_accuracy_summary():
         "weak": accuracy_for_rows(weak_rows[-300:]),
         "targets": target_accuracy,
         "best_target": best_target,
+        "range_model_leaderboard": range_leaderboard["items"],
+        "active_range_model": range_leaderboard["active"],
+        "self_learning": build_self_learning_status(
+            range_leaderboard
+        ),
     }
 
 
@@ -1103,6 +1357,7 @@ def cached_accuracy_summary():
     signature = (
         file_signature(PREDICTION_HISTORY_PATH),
         file_signature(RANGE_PREDICTION_HISTORY_PATH),
+        file_signature(RANGE_MODEL_HISTORY_PATH),
     )
 
     if (
@@ -1115,6 +1370,56 @@ def cached_accuracy_summary():
     ACCURACY_SUMMARY_CACHE["signature"] = signature
     ACCURACY_SUMMARY_CACHE["summary"] = copy.deepcopy(summary)
     return summary
+
+
+def candidate_from_active_model(range_estimate, active_model):
+    if not range_estimate or not active_model:
+        return None
+
+    model_name = active_model.get("candidate_model")
+
+    if not model_name:
+        return None
+
+    for candidate in range_estimate.get("model_candidates", []):
+        if candidate.get("candidate_model") == model_name:
+            return candidate
+
+    return None
+
+
+def apply_active_range_model(report, accuracy_summary):
+    active_model = (
+        accuracy_summary or {}
+    ).get("active_range_model")
+
+    if not active_model:
+        return report
+
+    next_round = report.get("next_round", {})
+    range_estimate = next_round.get("range_estimate")
+    candidate = candidate_from_active_model(
+        range_estimate,
+        active_model,
+    )
+
+    if not candidate or not is_actionable_candidate_range(candidate):
+        return report
+
+    selected = {
+        **range_estimate,
+        **candidate,
+        "coverage_range": (
+            range_estimate or {}
+        ).get("coverage_range"),
+        "model_candidates": (
+            range_estimate or {}
+        ).get("model_candidates", []),
+        "selected_by": "range_model_leaderboard",
+        "active_model": active_model,
+    }
+    report["next_round"]["range_estimate"] = selected
+    return report
 
 
 def prediction_quality(calls, profile_name, margin):
@@ -1403,6 +1708,12 @@ def compact_range_estimate(range_estimate):
         "clear_signal": range_estimate.get("clear_signal", False),
         "clear_reason": range_estimate.get("clear_reason", ""),
         "edge": range_estimate.get("edge", 0),
+        "target_confidence": range_estimate.get("target_confidence"),
+        "cashout_target": range_estimate.get("cashout_target"),
+        "coverage_gap": range_estimate.get("coverage_gap"),
+        "bucket_count": range_estimate.get("bucket_count"),
+        "coverage_range": range_estimate.get("coverage_range"),
+        "model_candidates": range_estimate.get("model_candidates", []),
         "runner_up_label": range_estimate.get("runner_up_label", ""),
         "runner_up_probability": range_estimate.get("runner_up_probability", 0),
     }
@@ -1458,6 +1769,61 @@ def score_range_prediction(range_prediction, actual_multiplier):
     }
 
 
+def is_actionable_candidate_range(range_prediction):
+    if not range_prediction:
+        return False
+
+    minimum = range_prediction.get("minimum")
+    maximum = range_prediction.get("maximum")
+
+    if minimum is None or maximum is None:
+        return False
+
+    try:
+        return float(maximum) <= ACTIONABLE_LEADERBOARD_MAXIMUM
+    except (TypeError, ValueError):
+        return False
+
+
+def score_range_model_candidate(range_prediction, actual_multiplier):
+    if not range_prediction:
+        return None
+
+    minimum = range_prediction.get("minimum")
+    maximum = range_prediction.get("maximum")
+
+    if minimum is None:
+        return None
+
+    try:
+        minimum_value = float(minimum)
+        maximum_value = None if maximum is None else float(maximum)
+        actual = float(actual_multiplier)
+    except (TypeError, ValueError):
+        return None
+
+    correct = actual >= minimum_value and (
+        maximum_value is None
+        or actual < maximum_value
+    )
+    scored = is_actionable_candidate_range(range_prediction)
+
+    return {
+        "candidate_model": range_prediction.get("candidate_model", "unknown"),
+        "label": range_prediction.get("label", ""),
+        "minimum": minimum_value,
+        "maximum": maximum_value,
+        "probability": range_prediction.get("probability"),
+        "confidence": range_prediction.get("confidence", ""),
+        "source": range_prediction.get("source", ""),
+        "range_type": range_prediction.get("range_type", ""),
+        "clear_signal": bool(range_prediction.get("clear_signal", False)),
+        "clear_reason": range_prediction.get("clear_reason", ""),
+        "scored": scored,
+        "correct": correct if scored else None,
+    }
+
+
 def score_pending_prediction(state, rounds):
     pending = state.get("pending")
 
@@ -1488,6 +1854,7 @@ def score_pending_prediction(state, rounds):
         return state.get("last_result")
 
     scored = []
+    range_candidate_results = []
     range_result = score_range_prediction(
         pending.get("range_prediction"),
         actual_multiplier,
@@ -1550,6 +1917,54 @@ def score_pending_prediction(state, rounds):
                     else int(range_result["correct"])
                 ),
             ]
+        )
+
+    for candidate in pending.get("range_prediction", {}).get("model_candidates", []):
+        candidate_result = score_range_model_candidate(
+            candidate,
+            actual_multiplier,
+        )
+
+        if not candidate_result:
+            continue
+
+        append_range_model_result(
+            [
+                now_string(),
+                pending.get("predicted_at", ""),
+                after_round_count,
+                actual_round_count,
+                actual_round.get("timestamp", ""),
+                RANGE_MODEL_VERSION,
+                candidate_result.get("candidate_model", ""),
+                candidate_result.get("label", ""),
+                f"{float(candidate_result['minimum']):.2f}",
+                (
+                    ""
+                    if candidate_result.get("maximum") is None
+                    else f"{float(candidate_result['maximum']):.2f}"
+                ),
+                (
+                    ""
+                    if candidate_result.get("probability") is None
+                    else f"{float(candidate_result['probability']):.6f}"
+                ),
+                candidate_result.get("confidence", ""),
+                candidate_result.get("source", ""),
+                candidate_result.get("range_type", ""),
+                int(candidate_result.get("clear_signal", False)),
+                candidate_result.get("clear_reason", ""),
+                int(candidate_result.get("scored", False)),
+                f"{actual_multiplier:.2f}",
+                (
+                    ""
+                    if candidate_result.get("correct") is None
+                    else int(candidate_result["correct"])
+                ),
+            ]
+        )
+        range_candidate_results.append(
+            candidate_result
         )
 
     for prediction in pending.get("predictions", []):
@@ -1656,6 +2071,7 @@ def score_pending_prediction(state, rounds):
         "actual_timestamp": actual_round.get("timestamp", ""),
         "actual_multiplier": actual_multiplier,
         "range_result": range_result,
+        "range_candidate_results": range_candidate_results,
         "results": scored,
     }
     scored_ids = state.setdefault("scored_ids", [])
@@ -1714,6 +2130,11 @@ def update_prediction_tracking(rounds, report, state=None, calibration=None):
 def compact_report(report, rounds):
     summary = report["summary"]
     recent = rounds[-60:]
+    next_round = copy.deepcopy(report["next_round"])
+    range_estimate = next_round.get("range_estimate")
+
+    if range_estimate:
+        range_estimate.setdefault("model_version", RANGE_MODEL_VERSION)
 
     return {
         "generated_at": report["generated_at"],
@@ -1722,6 +2143,7 @@ def compact_report(report, rounds):
         "data_selection": report.get("data_selection", {}),
         "ingest": ingest_status(rounds),
         "round_context": latest_round_context(),
+        "big_rounds": big_round_watch(rounds),
         "summary": {
             "rounds": summary["rounds"],
             "latest_multiplier": round_float(summary["latest_multiplier"]),
@@ -1732,7 +2154,7 @@ def compact_report(report, rounds):
             "buckets": summary["buckets"],
         },
         "overall_probabilities": report["overall_probabilities"],
-        "next_round": report["next_round"],
+        "next_round": next_round,
         "backtests": report["backtests"],
         "recent_rounds": [
             {
@@ -1823,6 +2245,7 @@ def compact_live_payload(payload):
         "data_selection": payload.get("data_selection", {}),
         "ingest": payload.get("ingest", {}),
         "round_context": payload.get("round_context"),
+        "big_rounds": payload.get("big_rounds"),
         "summary": {
             "rounds": summary.get("rounds", 0),
             "latest_multiplier": summary.get("latest_multiplier"),
@@ -1917,6 +2340,7 @@ def build_dashboard_payload(query, include_backtests=True):
                 "recent_rounds": [],
                 "chart_rounds": [],
                 "round_context": latest_round_context(),
+                "big_rounds": big_round_watch([]),
                 "data_selection": data_selection,
                 "tracking": {
                     "pending": None,
@@ -1941,6 +2365,11 @@ def build_dashboard_payload(query, include_backtests=True):
             calibration=calibration,
             data_selection=data_selection,
             include_backtests=include_backtests,
+        )
+        accuracy_summary = cached_accuracy_summary()
+        report = apply_active_range_model(
+            report,
+            accuracy_summary,
         )
         tracking = update_prediction_tracking(
             rounds,

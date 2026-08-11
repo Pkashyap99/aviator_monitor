@@ -27,6 +27,7 @@ Edit `config.json`:
 - `history_selector`: CSS selector matching multiplier/history elements
 - `poll_seconds`: how often to scan the page
 - `minimum_new_round_gap_seconds`: prevents duplicate captures
+- `require_source`: use `game` to accept both demo and real Aviatrix tabs, or `real` to require only real mode
 
 Finding a selector:
 1. Open the game in Chrome.
@@ -89,7 +90,7 @@ http://127.0.0.1:8765
 ```
 
 The dashboard polls `data/rounds.csv` quickly for live updates and shows the next-round estimate, previous prediction result, data source mode, live context, and compact accuracy tracking.
-For prediction history, it uses real rows plus legacy unlabeled rows and excludes rows explicitly marked as demo.
+For prediction history, it treats real and demo rows as the same game metric, then also keeps legacy unlabeled rows in the trusted history set.
 
 The dashboard also tracks whether each previous prediction matched the next actual multiplier. It writes:
 
