@@ -5,7 +5,22 @@ __pycache__/
 
 config.json
 
+models/challengers/
+
 data/*
 !data/.gitkeep
+!data/analysis.json
+!data/ml_backtest.csv
+!data/ml_backtest_summary.json
+!data/ml_live_predictions.csv
+!data/ml_predictions.json
+!data/ml_report.json
+!data/prediction_history.csv
+!data/provably_fair.csv
+!data/range_model_history.csv
+!data/range_prediction_history.csv
+!data/round_context.csv
+!data/round_ids.csv
+!data/rounds.csv
 
 .DS_Store

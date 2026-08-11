@@ -1,0 +1,550 @@
+{
+  "generated_at": "2026-08-08 11:00:24",
+  "csv_rounds": 3552,
+  "data_selection": {
+    "mode": "trusted",
+    "preferred_source": "real",
+    "minimum_source_rounds": 300,
+    "using_source_only": false,
+    "using_trusted_sources": true,
+    "source_rounds": 2302,
+    "legacy_rounds": 1250,
+    "trusted_rounds": 3552,
+    "excluded_rounds": 2,
+    "total_rounds": 3554,
+    "counts": {
+      "unlabeled": 1250,
+      "real": 2302,
+      "demo": 2
+    }
+  },
+  "summary": {
+    "rounds": 3552,
+    "latest_multiplier": 1.16,
+    "average": 8.38106418918919,
+    "minimum": 1.0,
+    "maximum": 2251.29,
+    "p25": 1.3,
+    "median": 2.02,
+    "p75": 4.13,
+    "p90": 10.73,
+    "buckets": {
+      "10.00+": 377,
+      "3.00-4.99": 447,
+      "2.00-2.99": 601,
+      "<1.20": 659,
+      "1.50-1.99": 563,
+      "5.00-9.99": 374,
+      "1.20-1.49": 531
+    }
+  },
+  "overall_probabilities": {
+    ">=1.50x": {
+      "hits": 2362,
+      "total": 3552,
+      "probability": 0.6649774774774775
+    },
+    ">=2.00x": {
+      "hits": 1799,
+      "total": 3552,
+      "probability": 0.5064752252252253
+    },
+    ">=3.00x": {
+      "hits": 1198,
+      "total": 3552,
+      "probability": 0.3372747747747748
+    },
+    ">=5.00x": {
+      "hits": 751,
+      "total": 3552,
+      "probability": 0.21143018018018017
+    },
+    ">=10.00x": {
+      "hits": 377,
+      "total": 3552,
+      "probability": 0.10613738738738739
+    },
+    ">=25.00x": {
+      "hits": 145,
+      "total": 3552,
+      "probability": 0.04082207207207207
+    },
+    ">=50.00x": {
+      "hits": 73,
+      "total": 3552,
+      "probability": 0.020551801801801804
+    },
+    ">=100.00x": {
+      "hits": 30,
+      "total": 3552,
+      "probability": 0.008445945945945946
+    }
+  },
+  "next_round": {
+    "lookback": 2,
+    "latest_pattern": [
+      "10.00+",
+      "<1.20"
+    ],
+    "pattern_match_count": 67,
+    "range_estimate": {
+      "label": "1.50x TO 5.00x",
+      "short": "1.50x-5.00x",
+      "minimum": 1.5,
+      "maximum": 5.0,
+      "probability": 0.4861344007050528,
+      "baseline_probability": 0.45354729729729737,
+      "low": 1.35,
+      "median": 2.18,
+      "high": 3.49,
+      "sample_size": 67,
+      "source": "pattern",
+      "range_type": "adaptive",
+      "confidence": "low",
+      "clear_signal": false,
+      "clear_reason": "range has not beaten baseline",
+      "edge": 0.03258710340775545,
+      "runner_up_label": "LESS THAN 1.20x",
+      "runner_up_probability": 0.1804072169996083,
+      "buckets": [
+        {
+          "label": "LESS THAN 1.20x",
+          "short": "<1.20x",
+          "minimum": 1.0,
+          "maximum": 1.2,
+          "probability": 0.1804072169996083,
+          "baseline_probability": 0.18552927927927929
+        },
+        {
+          "label": "1.20x TO 1.50x",
+          "short": "1.20x-1.50x",
+          "minimum": 1.2,
+          "maximum": 1.5,
+          "probability": 0.1345615452408931,
+          "baseline_probability": 0.14949324324324326
+        },
+        {
+          "label": "1.50x TO 2.00x",
+          "short": "1.50x-2.00x",
+          "minimum": 1.5,
+          "maximum": 2.0,
+          "probability": 0.14143600665883274,
+          "baseline_probability": 0.15850225225225226
+        },
+        {
+          "label": "2.00x TO 3.00x",
+          "short": "2.00x-3.00x",
+          "minimum": 2.0,
+          "maximum": 3.0,
+          "probability": 0.20844589698394045,
+          "baseline_probability": 0.16920045045045046
+        },
+        {
+          "label": "3.00x TO 5.00x",
+          "short": "3.00x-5.00x",
+          "minimum": 3.0,
+          "maximum": 5.0,
+          "probability": 0.13625249706227965,
+          "baseline_probability": 0.1258445945945946
+        },
+        {
+          "label": "5.00x TO 10.00x",
+          "short": "5.00x-10.00x",
+          "minimum": 5.0,
+          "maximum": 10.0,
+          "probability": 0.09107216999608304,
+          "baseline_probability": 0.10529279279279279
+        },
+        {
+          "label": "10.00x TO 25.00x",
+          "short": "10.00x-25.00x",
+          "minimum": 10.0,
+          "maximum": 25.0,
+          "probability": 0.05134528006267136,
+          "baseline_probability": 0.06531531531531531
+        },
+        {
+          "label": "25.00x TO 50.00x",
+          "short": "25.00x-50.00x",
+          "minimum": 25.0,
+          "maximum": 50.0,
+          "probability": 0.024472972972972972,
+          "baseline_probability": 0.02027027027027027
+        },
+        {
+          "label": "50.00x TO 100.00x",
+          "short": "50.00x-100.00x",
+          "minimum": 50.0,
+          "maximum": 100.0,
+          "probability": 0.01659013905209557,
+          "baseline_probability": 0.012105855855855855
+        },
+        {
+          "label": "MORE THAN 100.00x",
+          "short": "100.00x+",
+          "minimum": 100.0,
+          "maximum": null,
+          "probability": 0.015416274970622795,
+          "baseline_probability": 0.008445945945945946
+        }
+      ]
+    },
+    "predictions": [
+      {
+        "target": 1.5,
+        "probability": 0.6730276560949175,
+        "raw_probability": 0.6773623676581545,
+        "baseline_probability": 0.6649774774774775,
+        "edge": 0.008050178617440062,
+        "decision_margin": 0.0,
+        "predicted_high": true,
+        "confidence": "high",
+        "signal": "NEUTRAL",
+        "clear_signal": false,
+        "clear_reason": "weak signal",
+        "sample_size": 3552,
+        "source": "ensemble",
+        "profile": "balanced",
+        "components": {
+          "overall": 0.6649774774774775,
+          "recent": 0.7171709753231492,
+          "pattern": 0.6709309309309309,
+          "streak": 0.6506318265167822
+        },
+        "calibration": {
+          "edge_weight": 0.65
+        },
+        "evidence": {
+          "recent_rounds": 80,
+          "pattern_matches": 67,
+          "below_target_streak": 1,
+          "streak_matches": 781
+        }
+      },
+      {
+        "target": 2.0,
+        "probability": 0.5248362624399763,
+        "raw_probability": 0.5347229747863806,
+        "baseline_probability": 0.5064752252252253,
+        "edge": 0.01836103721475102,
+        "decision_margin": 0.0,
+        "predicted_high": true,
+        "confidence": "high",
+        "signal": "NEUTRAL",
+        "clear_signal": false,
+        "clear_reason": "weak signal",
+        "sample_size": 3552,
+        "source": "ensemble",
+        "profile": "balanced",
+        "components": {
+          "overall": 0.5064752252252253,
+          "recent": 0.5660619858989424,
+          "pattern": 0.5606906906906907,
+          "streak": 0.5051231787342899
+        },
+        "calibration": {
+          "edge_weight": 0.65
+        },
+        "evidence": {
+          "recent_rounds": 80,
+          "pattern_matches": 67,
+          "below_target_streak": 1,
+          "streak_matches": 881
+        }
+      },
+      {
+        "target": 3.0,
+        "probability": 0.3365727829591211,
+        "raw_probability": 0.3361947873660767,
+        "baseline_probability": 0.3372747747747748,
+        "edge": -0.0007019918156537241,
+        "decision_margin": 0.0,
+        "predicted_high": false,
+        "confidence": "high",
+        "signal": "NEUTRAL",
+        "clear_signal": false,
+        "clear_reason": "weak signal",
+        "sample_size": 3552,
+        "source": "ensemble",
+        "profile": "balanced",
+        "components": {
+          "overall": 0.3372747747747748,
+          "recent": 0.32660105757931845,
+          "pattern": 0.34264264264264266,
+          "streak": 0.33891794092943517
+        },
+        "calibration": {
+          "edge_weight": 0.65
+        },
+        "evidence": {
+          "recent_rounds": 80,
+          "pattern_matches": 67,
+          "below_target_streak": 1,
+          "streak_matches": 773
+        }
+      },
+      {
+        "target": 5.0,
+        "probability": 0.20286024116517093,
+        "raw_probability": 0.1982456586186275,
+        "baseline_probability": 0.21143018018018017,
+        "edge": -0.008569939015009242,
+        "decision_margin": 0.0,
+        "predicted_high": false,
+        "confidence": "high",
+        "signal": "NEUTRAL",
+        "clear_signal": false,
+        "clear_reason": "weak signal",
+        "sample_size": 3552,
+        "source": "ensemble",
+        "profile": "balanced",
+        "components": {
+          "overall": 0.21143018018018017,
+          "recent": 0.22323002350176263,
+          "pattern": 0.15588588588588587,
+          "streak": 0.19644078805768225
+        },
+        "calibration": {
+          "edge_weight": 0.65
+        },
+        "evidence": {
+          "recent_rounds": 80,
+          "pattern_matches": 67,
+          "below_target_streak": 1,
+          "streak_matches": 576
+        }
+      },
+      {
+        "target": 10.0,
+        "probability": 0.10679054091923869,
+        "raw_probability": 0.10714223897485092,
+        "baseline_probability": 0.10613738738738739,
+        "edge": 0.0006531535318513026,
+        "decision_margin": 0.0,
+        "predicted_high": false,
+        "confidence": "high",
+        "signal": "NEUTRAL",
+        "clear_signal": false,
+        "clear_reason": "weak signal",
+        "sample_size": 3552,
+        "source": "ensemble",
+        "profile": "balanced",
+        "components": {
+          "overall": 0.10613738738738739,
+          "recent": 0.10080052878965923,
+          "pattern": 0.11798798798798799,
+          "streak": 0.10198016129902358
+        },
+        "calibration": {
+          "edge_weight": 0.65
+        },
+        "evidence": {
+          "recent_rounds": 80,
+          "pattern_matches": 67,
+          "below_target_streak": 1,
+          "streak_matches": 324
+        }
+      },
+      {
+        "target": 25.0,
+        "probability": 0.049034066611044064,
+        "raw_probability": 0.05345590982433667,
+        "baseline_probability": 0.04082207207207207,
+        "edge": 0.008211994538971992,
+        "decision_margin": 0.0,
+        "predicted_high": false,
+        "confidence": "high",
+        "signal": "NEUTRAL",
+        "clear_signal": false,
+        "clear_reason": "weak signal",
+        "sample_size": 3552,
+        "source": "ensemble",
+        "profile": "balanced",
+        "components": {
+          "overall": 0.04082207207207207,
+          "recent": 0.05967244418331375,
+          "pattern": 0.07102102102102102,
+          "streak": 0.04329878865351838
+        },
+        "calibration": {
+          "edge_weight": 0.65
+        },
+        "evidence": {
+          "recent_rounds": 80,
+          "pattern_matches": 67,
+          "below_target_streak": 1,
+          "streak_matches": 138
+        }
+      },
+      {
+        "target": 50.0,
+        "probability": 0.026781056424476212,
+        "raw_probability": 0.030135270452070123,
+        "baseline_probability": 0.020551801801801804,
+        "edge": 0.006229254622674409,
+        "decision_margin": 0.0,
+        "predicted_high": false,
+        "confidence": "high",
+        "signal": "NEUTRAL",
+        "clear_signal": false,
+        "clear_reason": "weak signal",
+        "sample_size": 3552,
+        "source": "ensemble",
+        "profile": "balanced",
+        "components": {
+          "overall": 0.020551801801801804,
+          "recent": 0.04615893066980024,
+          "pattern": 0.02885885885885886,
+          "streak": 0.027917949595164783
+        },
+        "calibration": {
+          "edge_weight": 0.65
+        },
+        "evidence": {
+          "recent_rounds": 80,
+          "pattern_matches": 67,
+          "below_target_streak": 1,
+          "streak_matches": 69
+        }
+      },
+      {
+        "target": 100.0,
+        "probability": 0.012067237868963895,
+        "raw_probability": 0.014017164289050482,
+        "baseline_probability": 0.008445945945945946,
+        "edge": 0.003621291923017949,
+        "decision_margin": 0.0,
+        "predicted_high": false,
+        "confidence": "high",
+        "signal": "NEUTRAL",
+        "clear_signal": false,
+        "clear_reason": "weak signal",
+        "sample_size": 3552,
+        "source": "ensemble",
+        "profile": "balanced",
+        "components": {
+          "overall": 0.008445945945945946,
+          "recent": 0.011971210340775558,
+          "pattern": 0.027567567567567567,
+          "streak": 0.007842591539224132
+        },
+        "calibration": {
+          "edge_weight": 0.65
+        },
+        "evidence": {
+          "recent_rounds": 80,
+          "pattern_matches": 67,
+          "below_target_streak": 41,
+          "streak_matches": 3316
+        }
+      }
+    ]
+  },
+  "backtests": [
+    {
+      "target": 1.5,
+      "lookback": 2,
+      "min_matches": 5,
+      "method": "ensemble",
+      "tested_rounds": 500,
+      "coverage": 1.0,
+      "accuracy": 0.442,
+      "baseline_accuracy": 0.664,
+      "skill": -0.22200000000000003,
+      "baseline_probability": 0.6649774774774775,
+      "high_predictions": 253
+    },
+    {
+      "target": 2.0,
+      "lookback": 2,
+      "min_matches": 5,
+      "method": "ensemble",
+      "tested_rounds": 500,
+      "coverage": 1.0,
+      "accuracy": 0.496,
+      "baseline_accuracy": 0.512,
+      "skill": -0.016000000000000014,
+      "baseline_probability": 0.5064752252252253,
+      "high_predictions": 190
+    },
+    {
+      "target": 3.0,
+      "lookback": 2,
+      "min_matches": 5,
+      "method": "ensemble",
+      "tested_rounds": 500,
+      "coverage": 1.0,
+      "accuracy": 0.68,
+      "baseline_accuracy": 0.68,
+      "skill": 0.0,
+      "baseline_probability": 0.3372747747747748,
+      "high_predictions": 0
+    },
+    {
+      "target": 5.0,
+      "lookback": 2,
+      "min_matches": 5,
+      "method": "ensemble",
+      "tested_rounds": 500,
+      "coverage": 1.0,
+      "accuracy": 0.794,
+      "baseline_accuracy": 0.794,
+      "skill": 0.0,
+      "baseline_probability": 0.21143018018018017,
+      "high_predictions": 0
+    },
+    {
+      "target": 10.0,
+      "lookback": 2,
+      "min_matches": 5,
+      "method": "ensemble",
+      "tested_rounds": 500,
+      "coverage": 1.0,
+      "accuracy": 0.896,
+      "baseline_accuracy": 0.896,
+      "skill": 0.0,
+      "baseline_probability": 0.10613738738738739,
+      "high_predictions": 0
+    },
+    {
+      "target": 25.0,
+      "lookback": 2,
+      "min_matches": 5,
+      "method": "ensemble",
+      "tested_rounds": 500,
+      "coverage": 1.0,
+      "accuracy": 0.958,
+      "baseline_accuracy": 0.958,
+      "skill": 0.0,
+      "baseline_probability": 0.04082207207207207,
+      "high_predictions": 0
+    },
+    {
+      "target": 50.0,
+      "lookback": 2,
+      "min_matches": 5,
+      "method": "ensemble",
+      "tested_rounds": 500,
+      "coverage": 1.0,
+      "accuracy": 0.978,
+      "baseline_accuracy": 0.978,
+      "skill": 0.0,
+      "baseline_probability": 0.020551801801801804,
+      "high_predictions": 0
+    },
+    {
+      "target": 100.0,
+      "lookback": 2,
+      "min_matches": 5,
+      "method": "ensemble",
+      "tested_rounds": 500,
+      "coverage": 1.0,
+      "accuracy": 0.994,
+      "baseline_accuracy": 0.994,
+      "skill": 0.0,
+      "baseline_probability": 0.008445945945945946,
+      "high_predictions": 0
+    }
+  ],
+  "warning": "Crash-game multipliers are normally random. This report estimates historical frequencies and pattern-conditioned probabilities; it does not guarantee future results."
+}

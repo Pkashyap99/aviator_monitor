@@ -1,0 +1,57 @@
+{
+  "data_used_rounds": 7857,
+  "feature_schema_version": "multiplier-history-v1",
+  "model_version": "ml-research-v1",
+  "predictions": {
+    "1.50": {
+      "edge": 0.0,
+      "historical_baseline": 0.6590301641848033,
+      "holdout_brier_skill": 0.0,
+      "holdout_status": "NO PREDICTIVE EDGE DETECTED",
+      "model": "historical_frequency",
+      "note": "Probability is useful only if validation/holdout skill beats baseline.",
+      "probability": 0.6590301641848033,
+      "validation_status": "NO PREDICTIVE EDGE DETECTED"
+    },
+    "10.00": {
+      "edge": 0.0,
+      "historical_baseline": 0.10525645920834924,
+      "holdout_brier_skill": 0.0,
+      "holdout_status": "NO PREDICTIVE EDGE DETECTED",
+      "model": "historical_frequency",
+      "note": "Probability is useful only if validation/holdout skill beats baseline.",
+      "probability": 0.10525645920834924,
+      "validation_status": "NO PREDICTIVE EDGE DETECTED"
+    },
+    "2.00": {
+      "edge": 0.0,
+      "historical_baseline": 0.49866361206567394,
+      "holdout_brier_skill": 0.0,
+      "holdout_status": "NO PREDICTIVE EDGE DETECTED",
+      "model": "historical_frequency",
+      "note": "Probability is useful only if validation/holdout skill beats baseline.",
+      "probability": 0.49866361206567394,
+      "validation_status": "NO PREDICTIVE EDGE DETECTED"
+    },
+    "3.00": {
+      "edge": 0.0,
+      "historical_baseline": 0.33206058291968943,
+      "holdout_brier_skill": 0.0,
+      "holdout_status": "NO PREDICTIVE EDGE DETECTED",
+      "model": "historical_frequency",
+      "note": "Probability is useful only if validation/holdout skill beats baseline.",
+      "probability": 0.33206058291968943,
+      "validation_status": "NO PREDICTIVE EDGE DETECTED"
+    },
+    "5.00": {
+      "edge": 0.0,
+      "historical_baseline": 0.2060582919689449,
+      "holdout_brier_skill": 0.0,
+      "holdout_status": "NO PREDICTIVE EDGE DETECTED",
+      "model": "historical_frequency",
+      "note": "Probability is useful only if validation/holdout skill beats baseline.",
+      "probability": 0.2060582919689449,
+      "validation_status": "NO PREDICTIVE EDGE DETECTED"
+    }
+  }
+}

@@ -1159,11 +1159,13 @@ def scheduler_status(config: Optional[dict] = None, csv_path: Path = DEFAULT_ROU
     champion = ensure_champion()
     targets = champion_target_items(champion)
     valid_rounds = csv_valid_round_count(csv_path)
-    last_trained_rounds = max(
+    state = load_json(RETRAIN_STATE_PATH)
+    champion_trained_rounds = max(
         [int(item.get("trained_rounds", 0) or 0) for item in targets.values()] or [0]
     )
+    state_trained_rounds = int(state.get("last_trained_rounds", 0) or 0)
+    last_trained_rounds = max(champion_trained_rounds, state_trained_rounds)
     new_rounds = max(0, valid_rounds - last_trained_rounds)
-    state = load_json(RETRAIN_STATE_PATH)
     lock_exists = TRAINING_LOCK_PATH.exists()
     return {
         "enabled": True,
