@@ -7,15 +7,26 @@ import json
 from pathlib import Path
 from typing import Optional, Sequence
 
-from ml_features import DEFAULT_ROUNDS_PATH, next_round_feature_frame, write_json
-from ml_train import (
-    MANIFEST_PATH,
-    MODEL_VERSION,
-    PREDICTIONS_PATH,
-    REPORT_PATH,
-    load_model,
+from ml_features import (
+    DEFAULT_ROUNDS_PATH,
+    clean_rounds,
+    next_round_feature_frame,
+    write_json,
 )
-from ml_backtest import safe_positive_probability
+
+
+ROOT = Path(__file__).resolve().parent
+DATA_DIR = ROOT / "data"
+MODELS_DIR = ROOT / "models"
+MANIFEST_PATH = MODELS_DIR / "manifest.json"
+REPORT_PATH = DATA_DIR / "ml_report.json"
+PREDICTIONS_PATH = DATA_DIR / "ml_predictions.json"
+MODEL_VERSION = "ml-research-v1"
+LIVE_HISTORY_MODELS = {
+    "historical_frequency",
+    "recent_frequency_100",
+    "majority",
+}
 
 
 def load_json(path: Path) -> dict:
@@ -33,6 +44,33 @@ def format_percent(value) -> str:
     if value is None:
         return "--"
     return f"{float(value) * 100:.1f}%"
+
+
+def clipped_probability(value: float) -> float:
+    """Keep probabilities away from exact 0/1 for stable scoring."""
+
+    return min(max(float(value), 1e-6), 1 - 1e-6)
+
+
+def history_probability(rounds, target: float, model_name: str) -> Optional[float]:
+    """Return a live probability for baseline-style models."""
+
+    if rounds.empty:
+        return None
+
+    values = rounds["multiplier"].astype(float)
+    hits = values >= float(target)
+
+    if model_name == "historical_frequency":
+        return clipped_probability(hits.mean())
+
+    if model_name == "recent_frequency_100":
+        return clipped_probability(hits.tail(100).mean())
+
+    if model_name == "majority":
+        return clipped_probability(1.0 if hits.mean() >= 0.5 else 0.0)
+
+    return None
 
 
 def make_predictions(
@@ -53,28 +91,61 @@ def make_predictions(
             "predictions": {},
         }
 
-    feature_names = manifest.get("feature_names", [])
-    frame, quality = next_round_feature_frame(
-        csv_path,
-        feature_names=feature_names,
-        min_history=min_history,
-        include_context=include_context,
-    )
-    if frame.empty:
+    rounds, quality = clean_rounds(csv_path)
+    if rounds.empty:
         return {
             "model_version": manifest.get("model_version", MODEL_VERSION),
             "error": "No completed rounds available for ML prediction.",
             "predictions": {},
         }
 
+    target_items = manifest.get("targets", {})
+    needs_feature_frame = any(
+        item.get("model_name") not in LIVE_HISTORY_MODELS
+        for item in target_items.values()
+    )
+    frame = None
+
+    if needs_feature_frame:
+        feature_names = manifest.get("feature_names", [])
+        frame, quality = next_round_feature_frame(
+            csv_path,
+            feature_names=feature_names,
+            min_history=min_history,
+            include_context=include_context,
+        )
+        if frame.empty:
+            return {
+                "model_version": manifest.get("model_version", MODEL_VERSION),
+                "error": "No feature row available for ML prediction.",
+                "predictions": {},
+            }
+
     predictions = {}
     selected_models = report.get("selected_models", {})
     holdout_results = report.get("final_holdout_results", {})
-    for target, item in manifest.get("targets", {}).items():
-        model_path = Path(manifest_path).parent / item["model_path"]
-        estimator = load_model(model_path)
-        probability = float(safe_positive_probability(estimator, frame)[0])
-        baseline = item.get("historical_baseline_probability")
+    for target, item in target_items.items():
+        model_name = item.get("model_name")
+        target_value = float(item.get("target", target))
+        baseline = history_probability(
+            rounds,
+            target_value,
+            "historical_frequency",
+        )
+        probability = history_probability(
+            rounds,
+            target_value,
+            model_name,
+        )
+
+        if probability is None:
+            from ml_backtest import safe_positive_probability
+            from ml_train import load_model
+
+            model_path = Path(manifest_path).parent / item["model_path"]
+            estimator = load_model(model_path)
+            probability = float(safe_positive_probability(estimator, frame)[0])
+
         validation_metrics = selected_models.get(target, {}).get("validation_metrics", {})
         holdout_metrics = holdout_results.get(target, {}).get("holdout_metrics", {})
         predictions[target] = {

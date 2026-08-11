@@ -786,7 +786,7 @@ function buildMlFastDisplay(mlPrediction) {
   };
 }
 
-function renderMlPrediction(mlPrediction) {
+function renderMlPrediction(mlPrediction, mlRetrain) {
   if (
     !elements.mlPredictionPanel
     || !elements.mlModelStatus
@@ -807,7 +807,7 @@ function renderMlPrediction(mlPrediction) {
     elements.mlProbabilityList.textContent = mlPrediction && mlPrediction.error
       ? mlPrediction.error
       : "Waiting for trained model";
-    elements.mlModelMeta.textContent = "Run ml_train.py once if model files are missing.";
+    elements.mlModelMeta.textContent = `Run ml_train.py once if model files are missing. ${mlRetrainText(mlRetrain)}`;
     return;
   }
 
@@ -831,7 +831,40 @@ function renderMlPrediction(mlPrediction) {
     ? `${formatCount(mlPrediction.data_used_rounds)} rounds`
     : "round count unknown";
   const currentText = mlPrediction.is_current ? "current" : "refreshing";
-  elements.mlModelMeta.textContent = `${roundsText} | ${modelNames.join(", ") || "model"} | ${currentText}`;
+  elements.mlModelMeta.textContent = `${roundsText} | ${modelNames.join(", ") || "model"} | ${currentText} | ${mlRetrainText(mlRetrain)}`;
+}
+
+function mlRetrainText(mlRetrain) {
+  if (!mlRetrain) {
+    return "Auto learning: checking";
+  }
+
+  if (!mlRetrain.enabled) {
+    return "Auto learning: off";
+  }
+
+  if (mlRetrain.status === "training") {
+    return "Auto learning: retraining now";
+  }
+
+  if (mlRetrain.status === "failed") {
+    return "Auto learning: last retrain failed";
+  }
+
+  if (mlRetrain.status === "complete" && mlRetrain.last_success_at) {
+    const remaining = Number(mlRetrain.rounds_until_next_train || 0);
+    return remaining > 0
+      ? `Auto learning: refreshed at ${mlRetrain.last_success_at}, next in ${formatCount(remaining)} rounds`
+      : `Auto learning: refreshed at ${mlRetrain.last_success_at}`;
+  }
+
+  const remaining = Number(mlRetrain.rounds_until_next_train || 0);
+
+  if (remaining <= 0) {
+    return "Auto learning: retrain due soon";
+  }
+
+  return `Auto learning: next retrain in ${formatCount(remaining)} rounds`;
 }
 
 function formatRoundsAgo(value) {
@@ -1792,7 +1825,7 @@ function render(data) {
   renderSourceMode(data.data_selection);
   renderRoundContext(data.round_context);
   renderBigRounds(data.big_rounds);
-  renderMlPrediction(data.ml_prediction);
+  renderMlPrediction(data.ml_prediction, data.ml_retrain);
   renderAccuracySummary(data.accuracy_summary);
   if (elements.predictionList.offsetParent !== null) {
     renderPredictionList(data.next_round.predictions);
@@ -1846,6 +1879,7 @@ function buildRenderSignature(data) {
   const bestLearningModel = selfLearning.best_model || {};
   const mlPrediction = data.ml_prediction || {};
   const mlEntries = mlPredictionEntries(mlPrediction);
+  const mlRetrain = data.ml_retrain || {};
 
   return JSON.stringify({
     rounds: summary.rounds,
@@ -1893,6 +1927,12 @@ function buildRenderSignature(data) {
     mlDataUsed: mlPrediction.data_used_rounds,
     mlCurrent: mlPrediction.is_current,
     mlModelStatus: mlStatusLabel(mlPrediction),
+    mlRetrainStatus: mlRetrain.status,
+    mlRetrainCurrentRounds: mlRetrain.current_rounds,
+    mlRetrainLastTrained: mlRetrain.last_trained_rounds,
+    mlRetrainRemaining: mlRetrain.rounds_until_next_train,
+    mlRetrainSuccessAt: mlRetrain.last_success_at,
+    mlRetrainError: mlRetrain.last_error,
     mlPredictions: mlEntries.map((item) => [
       item.target,
       item.probability,

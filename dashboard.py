@@ -2,6 +2,8 @@ import argparse
 import copy
 import csv
 import json
+import subprocess
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -33,6 +35,7 @@ ROUND_CONTEXT_PATH = DATA_DIR / "round_context.csv"
 ML_PREDICTIONS_PATH = DATA_DIR / "ml_predictions.json"
 ML_REPORT_PATH = DATA_DIR / "ml_report.json"
 ML_MANIFEST_PATH = ROOT / "models" / "manifest.json"
+ML_RETRAIN_STATE_PATH = DATA_DIR / "ml_retrain_state.json"
 RANGE_MODEL_VERSION = "adaptive-v8-fine-multilookback"
 DASHBOARD_DIR = ROOT / "dashboard"
 TRACKED_TARGETS = [1.5, 2.0, 3.0, 5.0, 10.0, 20.0, 25.0, 50.0, 100.0]
@@ -42,6 +45,7 @@ TRACKING_LOCK = threading.Lock()
 BACKTEST_LOCK = threading.Lock()
 DISPLAY_MONEY_LOCK = threading.Lock()
 ML_PREDICTION_LOCK = threading.Lock()
+ML_RETRAIN_LOCK = threading.Lock()
 DASHBOARD_CACHE = {}
 CACHE_MAX_ITEMS = 12
 ACCURACY_SUMMARY_CACHE = {
@@ -69,6 +73,14 @@ DISPLAY_MONEY_CACHE = {
 ML_PREDICTION_CACHE = {
     "signature": None,
     "payload": None,
+}
+ML_RETRAIN_STATE = {
+    "thread": None,
+}
+ML_RETRAIN_SETTINGS = {
+    "enabled": True,
+    "min_new_rounds": 500,
+    "check_seconds": 30,
 }
 DISPLAY_MONEY_REFRESH_SECONDS = 2
 DISPLAY_MONEY_FIELDS = {
@@ -267,6 +279,7 @@ def refresh_cached_ingest(payload):
             payload["round_context"]["participants"] = None
 
     payload["round_context"] = latest_round_context()
+    payload["ml_retrain"] = ml_retrain_status_snapshot()
 
     with BACKTEST_LOCK:
         if (
@@ -409,6 +422,269 @@ def current_ml_prediction(round_count):
         payload,
         round_count,
     )
+
+
+def csv_data_row_count(path=CSV_PATH):
+    if not path.exists():
+        return 0
+
+    try:
+        with path.open("r", encoding="utf-8", errors="ignore") as f:
+            return max(0, sum(1 for _ in f) - 1)
+    except OSError:
+        return 0
+
+
+def save_ml_retrain_state(state):
+    DATA_DIR.mkdir(exist_ok=True)
+
+    with ML_RETRAIN_STATE_PATH.open("w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2, sort_keys=True)
+
+
+def load_ml_retrain_state():
+    state = load_json_file(ML_RETRAIN_STATE_PATH) or {}
+    if not isinstance(state, dict):
+        state = {}
+    return state
+
+
+def infer_last_trained_rounds():
+    state = load_ml_retrain_state()
+
+    for key in ("last_trained_rounds", "last_checked_rounds"):
+        try:
+            value = int(state.get(key, 0))
+        except (TypeError, ValueError):
+            value = 0
+
+        if value > 0:
+            return value
+
+    report = load_json_file(ML_REPORT_PATH) or {}
+    data_quality = report.get("data_quality", {})
+    dataset_statistics = report.get("dataset_statistics", {})
+
+    for value in (
+        data_quality.get("valid_rows"),
+        dataset_statistics.get("feature_rows"),
+    ):
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            parsed = 0
+
+        if parsed > 0:
+            return parsed
+
+    predictions = load_json_file(ML_PREDICTIONS_PATH) or {}
+
+    try:
+        return max(0, int(predictions.get("data_used_rounds", 0)))
+    except (TypeError, ValueError):
+        return 0
+
+
+def output_tail(text, max_lines=35):
+    lines = str(text or "").splitlines()
+    return "\n".join(lines[-max_lines:])
+
+
+def ml_retrain_status_snapshot():
+    settings = dict(ML_RETRAIN_SETTINGS)
+    state = load_ml_retrain_state()
+    current_rounds = csv_data_row_count()
+    last_trained_rounds = infer_last_trained_rounds()
+    new_rounds = max(0, current_rounds - last_trained_rounds)
+    min_new_rounds = int(settings.get("min_new_rounds", 500))
+    thread = ML_RETRAIN_STATE.get("thread")
+    is_training = bool(thread and thread.is_alive())
+
+    status = state.get("status") or "idle"
+
+    if is_training:
+        status = "training"
+    elif not settings.get("enabled", True):
+        status = "disabled"
+    elif current_rounds <= 0:
+        status = "waiting_for_data"
+    elif new_rounds < min_new_rounds and status not in ("complete", "failed"):
+        status = "waiting"
+
+    return {
+        "enabled": bool(settings.get("enabled", True)),
+        "status": status,
+        "current_rounds": current_rounds,
+        "last_trained_rounds": last_trained_rounds,
+        "new_rounds_since_train": new_rounds,
+        "min_new_rounds": min_new_rounds,
+        "rounds_until_next_train": max(0, min_new_rounds - new_rounds),
+        "check_seconds": int(settings.get("check_seconds", 30)),
+        "last_checked_at": state.get("last_checked_at"),
+        "last_started_at": state.get("last_started_at"),
+        "last_finished_at": state.get("last_finished_at"),
+        "last_success_at": state.get("last_success_at"),
+        "last_error": state.get("last_error"),
+        "last_returncode": state.get("last_returncode"),
+        "last_output_tail": state.get("last_output_tail"),
+    }
+
+
+def update_ml_retrain_status(**updates):
+    state = load_ml_retrain_state()
+    state.update(updates)
+    state["last_checked_at"] = now_string()
+    save_ml_retrain_state(state)
+    return state
+
+
+def clear_ml_dashboard_caches():
+    with ML_PREDICTION_LOCK:
+        ML_PREDICTION_CACHE["signature"] = None
+        ML_PREDICTION_CACHE["payload"] = None
+
+    DASHBOARD_CACHE.clear()
+
+
+def run_ml_retrain(current_rounds):
+    started_at = now_string()
+    update_ml_retrain_status(
+        status="training",
+        last_started_at=started_at,
+        last_error=None,
+        last_returncode=None,
+        started_rounds=current_rounds,
+    )
+
+    command = [
+        sys.executable,
+        str(ROOT / "ml_train.py"),
+    ]
+
+    try:
+        result = subprocess.run(
+            command,
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+            timeout=60 * 45,
+        )
+        combined_output = "\n".join(
+            item
+            for item in (result.stdout, result.stderr)
+            if item
+        )
+        finished_rounds = csv_data_row_count()
+
+        if result.returncode == 0:
+            update_ml_retrain_status(
+                status="complete",
+                last_finished_at=now_string(),
+                last_success_at=now_string(),
+                last_trained_rounds=finished_rounds,
+                last_returncode=result.returncode,
+                last_output_tail=output_tail(combined_output),
+                last_error=None,
+            )
+            clear_ml_dashboard_caches()
+            return
+
+        update_ml_retrain_status(
+            status="failed",
+            last_finished_at=now_string(),
+            last_returncode=result.returncode,
+            last_output_tail=output_tail(combined_output),
+            last_error="ml_train.py failed",
+        )
+
+    except Exception as exc:
+        update_ml_retrain_status(
+            status="failed",
+            last_finished_at=now_string(),
+            last_error=f"{type(exc).__name__}: {exc}",
+        )
+
+
+def maybe_start_ml_retrain():
+    settings = ML_RETRAIN_SETTINGS
+
+    if not settings.get("enabled", True):
+        update_ml_retrain_status(
+            status="disabled",
+        )
+        return
+
+    current_rounds = csv_data_row_count()
+    last_trained_rounds = infer_last_trained_rounds()
+    min_new_rounds = int(settings.get("min_new_rounds", 500))
+    new_rounds = current_rounds - last_trained_rounds
+
+    with ML_RETRAIN_LOCK:
+        thread = ML_RETRAIN_STATE.get("thread")
+
+        if thread and thread.is_alive():
+            update_ml_retrain_status(
+                status="training",
+                current_rounds=current_rounds,
+                last_trained_rounds=last_trained_rounds,
+            )
+            return
+
+        if current_rounds <= 0:
+            update_ml_retrain_status(
+                status="waiting_for_data",
+                current_rounds=current_rounds,
+                last_trained_rounds=last_trained_rounds,
+            )
+            return
+
+        if new_rounds < min_new_rounds:
+            update_ml_retrain_status(
+                status="waiting",
+                current_rounds=current_rounds,
+                last_trained_rounds=last_trained_rounds,
+                rounds_until_next_train=max(0, min_new_rounds - new_rounds),
+            )
+            return
+
+        thread = threading.Thread(
+            target=run_ml_retrain,
+            args=(current_rounds,),
+            daemon=True,
+        )
+        ML_RETRAIN_STATE["thread"] = thread
+        thread.start()
+
+
+def start_ml_auto_retrainer(enabled=True, min_new_rounds=500, check_seconds=30):
+    ML_RETRAIN_SETTINGS.update(
+        {
+            "enabled": bool(enabled),
+            "min_new_rounds": max(1, int(min_new_rounds)),
+            "check_seconds": max(5, int(check_seconds)),
+        }
+    )
+
+    def worker():
+        while True:
+            try:
+                maybe_start_ml_retrain()
+            except Exception as exc:
+                update_ml_retrain_status(
+                    status="failed",
+                    last_error=f"{type(exc).__name__}: {exc}",
+                )
+
+            time.sleep(
+                ML_RETRAIN_SETTINGS["check_seconds"]
+            )
+
+    thread = threading.Thread(
+        target=worker,
+        daemon=True,
+    )
+    thread.start()
+    return thread
 
 
 def recent_csv_rows(path, max_rows, max_bytes):
@@ -2382,6 +2658,7 @@ def compact_live_payload(payload):
         ),
         "accuracy_summary": payload.get("accuracy_summary"),
         "ml_prediction": payload.get("ml_prediction"),
+        "ml_retrain": payload.get("ml_retrain"),
         "cache_age_ms": payload.get("cache_age_ms"),
     }
 
@@ -2460,6 +2737,7 @@ def build_dashboard_payload(query, include_backtests=True):
                 "round_context": latest_round_context(),
                 "big_rounds": big_round_watch([]),
                 "ml_prediction": current_ml_prediction(0),
+                "ml_retrain": ml_retrain_status_snapshot(),
                 "data_selection": data_selection,
                 "tracking": {
                     "pending": None,
@@ -2502,6 +2780,7 @@ def build_dashboard_payload(query, include_backtests=True):
         payload["ml_prediction"] = current_ml_prediction(
             len(all_rounds)
         )
+        payload["ml_retrain"] = ml_retrain_status_snapshot()
         payload["_cached_at"] = time.monotonic()
 
         if len(DASHBOARD_CACHE) >= CACHE_MAX_ITEMS:
@@ -2671,15 +2950,71 @@ def main():
     )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument(
+        "--disable-ml-auto-retrain",
+        action="store_true",
+        help="Do not refresh ML models automatically while the dashboard runs.",
+    )
+    parser.add_argument(
+        "--ml-retrain-min-new-rounds",
+        type=int,
+        default=None,
+        help="Retrain after this many new CSV rounds since the last successful ML train.",
+    )
+    parser.add_argument(
+        "--ml-retrain-check-seconds",
+        type=int,
+        default=None,
+        help="How often the dashboard checks whether ML retraining is due.",
+    )
     args = parser.parse_args()
+    config = load_json_file(CONFIG_PATH) or {}
+    ml_auto_retrain_enabled = bool(
+        config.get(
+            "ml_auto_retrain",
+            True,
+        )
+    ) and not args.disable_ml_auto_retrain
+    ml_retrain_min_new_rounds = (
+        args.ml_retrain_min_new_rounds
+        if args.ml_retrain_min_new_rounds is not None
+        else int(
+            config.get(
+                "ml_retrain_min_new_rounds",
+                500,
+            )
+        )
+    )
+    ml_retrain_check_seconds = (
+        args.ml_retrain_check_seconds
+        if args.ml_retrain_check_seconds is not None
+        else int(
+            config.get(
+                "ml_retrain_check_seconds",
+                30,
+            )
+        )
+    )
 
     server = ThreadingHTTPServer(
         (args.host, args.port),
         DashboardHandler,
     )
     start_cache_warmer()
+    start_ml_auto_retrainer(
+        enabled=ml_auto_retrain_enabled,
+        min_new_rounds=ml_retrain_min_new_rounds,
+        check_seconds=ml_retrain_check_seconds,
+    )
 
     print(f"Dashboard running at http://{args.host}:{args.port}")
+    if ml_auto_retrain_enabled:
+        print(
+            "ML auto-retrain enabled "
+            f"(every {ml_retrain_min_new_rounds} new rounds)."
+        )
+    else:
+        print("ML auto-retrain disabled.")
     print("Press Ctrl+C to stop.")
 
     try:

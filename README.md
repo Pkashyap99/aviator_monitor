@@ -112,6 +112,18 @@ Generate current next-round ML probability estimates:
 python3 ml_predict.py
 ```
 
+When the dashboard runs, it can refresh ML models automatically. By default it
+checks every 30 seconds and retrains after 500 new saved rounds:
+
+```json
+"ml_auto_retrain": true,
+"ml_retrain_min_new_rounds": 500,
+"ml_retrain_check_seconds": 30
+```
+
+This retraining uses the same fixed walk-forward and holdout rules. It does not
+change thresholds merely because a final holdout result looked poor.
+
 Useful target-specific backtest:
 
 ```bash

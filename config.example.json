@@ -12,6 +12,9 @@
   "minimum_new_round_gap_seconds": 1.5,
   "require_source": "real",
   "collect_round_context": true,
+  "ml_auto_retrain": true,
+  "ml_retrain_min_new_rounds": 500,
+  "ml_retrain_check_seconds": 30,
   "participant_count_selector": ".flight-radar-participants-count",
   "headless": false,
   "strategy": {
