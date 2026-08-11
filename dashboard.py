@@ -30,6 +30,9 @@ PREDICTION_HISTORY_PATH = DATA_DIR / "prediction_history.csv"
 RANGE_PREDICTION_HISTORY_PATH = DATA_DIR / "range_prediction_history.csv"
 RANGE_MODEL_HISTORY_PATH = DATA_DIR / "range_model_history.csv"
 ROUND_CONTEXT_PATH = DATA_DIR / "round_context.csv"
+ML_PREDICTIONS_PATH = DATA_DIR / "ml_predictions.json"
+ML_REPORT_PATH = DATA_DIR / "ml_report.json"
+ML_MANIFEST_PATH = ROOT / "models" / "manifest.json"
 RANGE_MODEL_VERSION = "adaptive-v8-fine-multilookback"
 DASHBOARD_DIR = ROOT / "dashboard"
 TRACKED_TARGETS = [1.5, 2.0, 3.0, 5.0, 10.0, 20.0, 25.0, 50.0, 100.0]
@@ -38,6 +41,7 @@ BIG_MULTIPLIER_RECENT_LIMIT = 8
 TRACKING_LOCK = threading.Lock()
 BACKTEST_LOCK = threading.Lock()
 DISPLAY_MONEY_LOCK = threading.Lock()
+ML_PREDICTION_LOCK = threading.Lock()
 DASHBOARD_CACHE = {}
 CACHE_MAX_ITEMS = 12
 ACCURACY_SUMMARY_CACHE = {
@@ -61,6 +65,10 @@ DISPLAY_MONEY_CACHE = {
     "signature": None,
     "settings": None,
     "checked_at": 0,
+}
+ML_PREDICTION_CACHE = {
+    "signature": None,
+    "payload": None,
 }
 DISPLAY_MONEY_REFRESH_SECONDS = 2
 DISPLAY_MONEY_FIELDS = {
@@ -296,6 +304,110 @@ def file_signature(path):
     return (
         stat.st_mtime_ns,
         stat.st_size,
+    )
+
+
+def load_json_file(path):
+    if not path.exists():
+        return None
+
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def compact_ml_prediction_payload(payload, round_count):
+    if not payload:
+        return {
+            "available": False,
+            "error": "ML prediction data is not available yet.",
+            "predictions": {},
+        }
+
+    compact = {
+        "available": not bool(payload.get("error")),
+        "error": payload.get("error"),
+        "generated_at": payload.get("generated_at"),
+        "model_version": payload.get("model_version"),
+        "feature_schema_version": payload.get("feature_schema_version"),
+        "data_used_rounds": payload.get("data_used_rounds"),
+        "rounds_in_csv": round_count,
+        "is_current": (
+            payload.get("data_used_rounds") >= round_count
+            if payload.get("data_used_rounds") is not None
+            else False
+        ),
+        "predictions": {},
+    }
+
+    for target, item in (payload.get("predictions") or {}).items():
+        compact["predictions"][target] = {
+            "probability": item.get("probability"),
+            "historical_baseline": item.get("historical_baseline"),
+            "edge": item.get("edge"),
+            "model": item.get("model"),
+            "validation_status": item.get("validation_status"),
+            "holdout_status": item.get("holdout_status"),
+            "holdout_brier_skill": item.get("holdout_brier_skill"),
+            "note": item.get("note"),
+        }
+
+    return compact
+
+
+def current_ml_prediction(round_count):
+    signature = (
+        csv_signature(),
+        file_signature(ML_MANIFEST_PATH),
+        file_signature(ML_REPORT_PATH),
+    )
+
+    with ML_PREDICTION_LOCK:
+        if (
+            ML_PREDICTION_CACHE["signature"] == signature
+            and ML_PREDICTION_CACHE["payload"] is not None
+        ):
+            return compact_ml_prediction_payload(
+                copy.deepcopy(ML_PREDICTION_CACHE["payload"]),
+                round_count,
+            )
+
+    try:
+        from ml_predict import make_predictions
+
+        payload = make_predictions(
+            csv_path=CSV_PATH,
+            manifest_path=ML_MANIFEST_PATH,
+            report_path=ML_REPORT_PATH,
+            min_history=100,
+            include_context=False,
+        )
+        payload.setdefault(
+            "generated_at",
+            now_string(),
+        )
+    except Exception as exc:
+        payload = load_json_file(
+            ML_PREDICTIONS_PATH
+        ) or {
+            "model_version": "ml-research-v1",
+            "error": f"ML prediction unavailable: {type(exc).__name__}: {exc}",
+            "predictions": {},
+        }
+        payload.setdefault(
+            "generated_at",
+            now_string(),
+        )
+
+    with ML_PREDICTION_LOCK:
+        ML_PREDICTION_CACHE["signature"] = signature
+        ML_PREDICTION_CACHE["payload"] = copy.deepcopy(payload)
+
+    return compact_ml_prediction_payload(
+        payload,
+        round_count,
     )
 
 
@@ -2269,6 +2381,7 @@ def compact_live_payload(payload):
             payload.get("tracking")
         ),
         "accuracy_summary": payload.get("accuracy_summary"),
+        "ml_prediction": payload.get("ml_prediction"),
         "cache_age_ms": payload.get("cache_age_ms"),
     }
 
@@ -2292,6 +2405,10 @@ def build_dashboard_payload(query, include_backtests=True):
         current_config_signature = file_signature(
             CONFIG_PATH
         )
+        current_ml_signature = (
+            file_signature(ML_MANIFEST_PATH),
+            file_signature(ML_REPORT_PATH),
+        )
 
         cache_key = (
             lookback,
@@ -2299,6 +2416,7 @@ def build_dashboard_payload(query, include_backtests=True):
             include_backtests,
             current_csv_signature,
             current_config_signature,
+            current_ml_signature,
         )
         cached = DASHBOARD_CACHE.get(cache_key)
 
@@ -2341,6 +2459,7 @@ def build_dashboard_payload(query, include_backtests=True):
                 "chart_rounds": [],
                 "round_context": latest_round_context(),
                 "big_rounds": big_round_watch([]),
+                "ml_prediction": current_ml_prediction(0),
                 "data_selection": data_selection,
                 "tracking": {
                     "pending": None,
@@ -2380,6 +2499,9 @@ def build_dashboard_payload(query, include_backtests=True):
         payload = compact_report(report, rounds)
         payload["tracking"] = tracking
         payload["accuracy_summary"] = cached_accuracy_summary()
+        payload["ml_prediction"] = current_ml_prediction(
+            len(all_rounds)
+        )
         payload["_cached_at"] = time.monotonic()
 
         if len(DASHBOARD_CACHE) >= CACHE_MAX_ITEMS:

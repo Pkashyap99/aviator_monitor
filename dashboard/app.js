@@ -29,6 +29,10 @@ const elements = {
   bigRoundPanel: document.getElementById("bigRoundPanel"),
   bigRoundStatus: document.getElementById("bigRoundStatus"),
   bigRoundList: document.getElementById("bigRoundList"),
+  mlPredictionPanel: document.getElementById("mlPredictionPanel"),
+  mlModelStatus: document.getElementById("mlModelStatus"),
+  mlProbabilityList: document.getElementById("mlProbabilityList"),
+  mlModelMeta: document.getElementById("mlModelMeta"),
   latestMultiplier: document.getElementById("latestMultiplier"),
   roundCount: document.getElementById("roundCount"),
   medianValue: document.getElementById("medianValue"),
@@ -88,6 +92,21 @@ function formatSignedPercent(value) {
   const number = Number(value);
   const sign = number > 0 ? "+" : "";
   return `${sign}${(number * 100).toFixed(1)}%`;
+}
+
+function formatPercentagePoints(value) {
+  if (value === null || value === undefined) {
+    return "--";
+  }
+
+  const number = Number(value);
+
+  if (!Number.isFinite(number)) {
+    return "--";
+  }
+
+  const sign = number > 0 ? "+" : "";
+  return `${sign}${(number * 100).toFixed(1)} pp`;
 }
 
 function formatContextNumber(value) {
@@ -664,6 +683,155 @@ function bigMultiplierWatch(predictions) {
   }
 
   return `High round chance: normal (${formatPercent(strongest.probability)} for ${Number(strongest.target).toFixed(0)}x+)`;
+}
+
+function mlPredictionEntries(mlPrediction) {
+  return Object.entries((mlPrediction && mlPrediction.predictions) || {})
+    .map(([target, item]) => ({
+      target: Number(target),
+      ...(item || {}),
+    }))
+    .filter((item) => Number.isFinite(item.target))
+    .sort((left, right) => left.target - right.target);
+}
+
+function mlTarget(mlPrediction, target) {
+  return mlPredictionEntries(mlPrediction).find(
+    (item) => Number(item.target).toFixed(2) === Number(target).toFixed(2)
+  );
+}
+
+function mlHasProvenEdge(mlPrediction) {
+  return mlPredictionEntries(mlPrediction).some((item) => {
+    const status = String(item.holdout_status || item.validation_status || "");
+    const edge = Math.abs(Number(item.edge || 0));
+    const brierSkill = Number(item.holdout_brier_skill || 0);
+    return status.includes("CONSISTENT") || (edge >= 0.02 && brierSkill > 0);
+  });
+}
+
+function mlStatusLabel(mlPrediction) {
+  if (!mlPrediction) {
+    return "ML: waiting";
+  }
+
+  if (!mlPrediction.available) {
+    return "ML: not ready";
+  }
+
+  if (mlHasProvenEdge(mlPrediction)) {
+    return "ML: edge detected";
+  }
+
+  return "ML: no proven edge";
+}
+
+function mlBigWatchText(mlPrediction) {
+  const p10 = mlTarget(mlPrediction, 10);
+
+  if (!p10) {
+    return "10x chance: waiting";
+  }
+
+  return `10x chance: ${formatPercent(p10.probability)}`;
+}
+
+function buildMlFastDisplay(mlPrediction) {
+  if (!mlPrediction || !mlPrediction.available) {
+    return null;
+  }
+
+  const p15 = mlTarget(mlPrediction, 1.5);
+  const p2 = mlTarget(mlPrediction, 2);
+  const p3 = mlTarget(mlPrediction, 3);
+  const p5 = mlTarget(mlPrediction, 5);
+  const p10 = mlTarget(mlPrediction, 10);
+  const entries = mlPredictionEntries(mlPrediction);
+
+  if (!entries.length) {
+    return null;
+  }
+
+  const hasEdge = mlHasProvenEdge(mlPrediction);
+  const bestEdge = entries
+    .slice()
+    .sort((left, right) => Math.abs(Number(right.edge || 0)) - Math.abs(Number(left.edge || 0)))[0];
+  const main = p2 || p15 || entries[0];
+  const probabilityLine = [
+    p15 ? `1.5x ${formatPercent(p15.probability)}` : null,
+    p2 ? `2x ${formatPercent(p2.probability)}` : null,
+    p3 ? `3x ${formatPercent(p3.probability)}` : null,
+    p5 ? `5x ${formatPercent(p5.probability)}` : null,
+    p10 ? `10x ${formatPercent(p10.probability)}` : null,
+  ].filter(Boolean).join(" | ");
+
+  if (!hasEdge) {
+    return {
+      tone: "fast-range",
+      text: `${Number(main.target).toFixed(0)}x+ chance ${formatPercent(main.probability)}`,
+      meta: `${probabilityLine} | same as history`,
+      signal: "Model status: no proven edge",
+      cashout: "ML has no reliable cashout target",
+      bigWatch: mlBigWatchText(mlPrediction),
+    };
+  }
+
+  return {
+    tone: Number(bestEdge.target) >= 2 ? "fast-high" : "fast-range",
+    text: `${Number(bestEdge.target).toFixed(0)}x+ chance ${formatPercent(bestEdge.probability)}`,
+    meta: `Edge ${formatPercentagePoints(bestEdge.edge)} vs history | ${probabilityLine}`,
+    signal: `Model status: ${bestEdge.holdout_status || bestEdge.validation_status || "active"}`,
+    cashout: `ML target: ${Number(bestEdge.target).toFixed(2)}x area`,
+    bigWatch: mlBigWatchText(mlPrediction),
+  };
+}
+
+function renderMlPrediction(mlPrediction) {
+  if (
+    !elements.mlPredictionPanel
+    || !elements.mlModelStatus
+    || !elements.mlProbabilityList
+    || !elements.mlModelMeta
+  ) {
+    return;
+  }
+
+  elements.mlPredictionPanel.classList.toggle(
+    "has-edge",
+    mlHasProvenEdge(mlPrediction),
+  );
+  elements.mlModelStatus.textContent = mlStatusLabel(mlPrediction);
+  elements.mlProbabilityList.innerHTML = "";
+
+  if (!mlPrediction || !mlPrediction.available) {
+    elements.mlProbabilityList.textContent = mlPrediction && mlPrediction.error
+      ? mlPrediction.error
+      : "Waiting for trained model";
+    elements.mlModelMeta.textContent = "Run ml_train.py once if model files are missing.";
+    return;
+  }
+
+  const visibleEntries = mlPredictionEntries(mlPrediction).filter(
+    (item) => [1.5, 2, 3, 5, 10].includes(Number(item.target))
+  );
+
+  for (const item of visibleEntries) {
+    const row = document.createElement("div");
+    row.className = "ml-probability-row";
+    row.innerHTML = `
+      <span>${Number(item.target).toFixed(item.target === 10 ? 0 : 1)}x+</span>
+      <strong>${formatPercent(item.probability)}</strong>
+      <small>${formatPercentagePoints(item.edge)} vs history</small>
+    `;
+    elements.mlProbabilityList.appendChild(row);
+  }
+
+  const modelNames = [...new Set(visibleEntries.map((item) => item.model).filter(Boolean))];
+  const roundsText = mlPrediction.data_used_rounds
+    ? `${formatCount(mlPrediction.data_used_rounds)} rounds`
+    : "round count unknown";
+  const currentText = mlPrediction.is_current ? "current" : "refreshing";
+  elements.mlModelMeta.textContent = `${roundsText} | ${modelNames.join(", ") || "model"} | ${currentText}`;
 }
 
 function formatRoundsAgo(value) {
@@ -1285,6 +1453,19 @@ function renderFastPrediction(data) {
     return;
   }
 
+  const mlDisplay = buildMlFastDisplay(data.ml_prediction);
+
+  if (mlDisplay) {
+    elements.fastMain.classList.add(mlDisplay.tone);
+    elements.fastPredictionText.textContent = mlDisplay.text;
+    elements.fastPredictionMeta.textContent = mlDisplay.meta;
+    elements.signalStrengthText.textContent = mlDisplay.signal;
+    elements.bigWatchText.textContent = mlDisplay.bigWatch;
+    elements.fastSignalText.textContent = liveDataLabel(data);
+    elements.cashoutGuideText.textContent = liveDataDetail(data, mlDisplay.cashout);
+    return;
+  }
+
   if (!display) {
     elements.fastPredictionText.textContent = "Waiting";
     elements.fastPredictionMeta.textContent = "Collecting prediction data";
@@ -1611,6 +1792,7 @@ function render(data) {
   renderSourceMode(data.data_selection);
   renderRoundContext(data.round_context);
   renderBigRounds(data.big_rounds);
+  renderMlPrediction(data.ml_prediction);
   renderAccuracySummary(data.accuracy_summary);
   if (elements.predictionList.offsetParent !== null) {
     renderPredictionList(data.next_round.predictions);
@@ -1662,6 +1844,8 @@ function buildRenderSignature(data) {
   const activeRangeModel = accuracy.active_range_model || {};
   const selfLearning = accuracy.self_learning || {};
   const bestLearningModel = selfLearning.best_model || {};
+  const mlPrediction = data.ml_prediction || {};
+  const mlEntries = mlPredictionEntries(mlPrediction);
 
   return JSON.stringify({
     rounds: summary.rounds,
@@ -1705,6 +1889,17 @@ function buildRenderSignature(data) {
     learningRemaining: selfLearning.rounds_until_auto_select,
     learningBest: bestLearningModel.candidate_model,
     learningBestAccuracy: bestLearningModel.accuracy,
+    mlAvailable: mlPrediction.available,
+    mlDataUsed: mlPrediction.data_used_rounds,
+    mlCurrent: mlPrediction.is_current,
+    mlModelStatus: mlStatusLabel(mlPrediction),
+    mlPredictions: mlEntries.map((item) => [
+      item.target,
+      item.probability,
+      item.historical_baseline,
+      item.edge,
+      item.holdout_status,
+    ]),
     predictionSignals: predictions.map((item) => [
       item.target,
       item.probability,

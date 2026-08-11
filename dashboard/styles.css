@@ -758,6 +758,70 @@ body {
     var(--panel);
 }
 
+.ml-panel {
+  display: grid;
+  grid-column: 1 / -1;
+  gap: 10px;
+  border-color: rgba(99, 167, 255, 0.28);
+  background:
+    linear-gradient(145deg, rgba(99, 167, 255, 0.12), rgba(78, 215, 209, 0.07)),
+    var(--panel);
+}
+
+.ml-panel.has-edge {
+  border-color: rgba(43, 209, 126, 0.42);
+  background:
+    linear-gradient(145deg, rgba(43, 209, 126, 0.14), rgba(99, 167, 255, 0.08)),
+    var(--panel);
+}
+
+.ml-model-status {
+  color: var(--blue);
+  font-size: clamp(22px, 4vw, 34px);
+  line-height: 1.05;
+}
+
+.ml-panel.has-edge .ml-model-status {
+  color: var(--green);
+}
+
+.ml-probability-list {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.ml-probability-row {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  min-height: 72px;
+  padding: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.045);
+}
+
+.ml-probability-row span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.ml-probability-row strong {
+  color: var(--text);
+  font-size: clamp(18px, 3vw, 28px);
+  line-height: 1;
+}
+
+.ml-probability-row small,
+.ml-model-meta {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+  line-height: 1.25;
+}
+
 .big-round-panel.fresh {
   animation: bigRoundPulse 2.4s ease;
 }
@@ -955,13 +1019,18 @@ body {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
+  .ml-probability-list {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
   .fast-main {
     min-height: 240px;
   }
 }
 
 @media (max-width: 420px) {
-  .context-mode.context-cards {
+  .context-mode.context-cards,
+  .ml-probability-list {
     grid-template-columns: 1fr;
   }
 }

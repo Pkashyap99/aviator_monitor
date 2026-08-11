@@ -75,6 +75,67 @@ data/analysis.json
 
 Important: crash-game multipliers are normally random. This report estimates historical frequencies and pattern-conditioned probabilities; it does not guarantee future results.
 
+## ML research pipeline
+
+This project also includes a separate machine-learning research pipeline. It is designed to test whether historical multipliers contain a repeatable next-round signal. It does **not** assume the game is predictable.
+
+Install ML dependencies on a MacBook from VS Code terminal:
+
+```bash
+cd /Users/kumarprashant/Downloads/aviator_monitor
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install -r requirements.txt
+```
+
+Run chronological walk-forward validation:
+
+```bash
+python3 ml_backtest.py
+```
+
+Train selected models and evaluate the newest untouched holdout block once:
+
+```bash
+python3 ml_train.py
+```
+
+Print the saved report:
+
+```bash
+python3 ml_report.py
+```
+
+Generate current next-round ML probability estimates:
+
+```bash
+python3 ml_predict.py
+```
+
+Useful target-specific backtest:
+
+```bash
+python3 ml_backtest.py --target 2 --min-train 5000 --test-size 1000
+```
+
+Optional calibration comparison:
+
+```bash
+python3 ml_backtest.py --target 2 --calibration uncalibrated,sigmoid,isotonic
+```
+
+Artifacts:
+
+```text
+data/ml_report.json
+data/ml_backtest.csv
+data/ml_predictions.json
+models/manifest.json
+models/target_*.joblib
+```
+
+Guardrail: the final holdout is the newest 15-20% of feature rows. It is reserved before model selection and evaluated once. Do not change model settings or thresholds merely to improve that final holdout result after seeing it. If the holdout is poor, the correct conclusion is that no reliable predictive edge has been proven.
+
 ## Realtime dashboard
 
 Run:
@@ -109,6 +170,11 @@ When recent learned profiles do not beat the majority baseline, the dashboard su
 
 - `aviator_monitor.py` - browser collector
 - `aviator_analyzer.py` - CSV analysis and probability report
+- `ml_features.py` - deterministic leakage-safe feature generation and data-quality reporting
+- `ml_backtest.py` - chronological walk-forward validation
+- `ml_train.py` - model selection, final holdout evaluation, and model saving
+- `ml_predict.py` - current next-round ML probability estimates
+- `ml_report.py` - concise report printer
 - `dashboard.py` - local realtime dashboard server
 - `dashboard/` - dashboard UI files
 - `config.example.json` - configuration example
