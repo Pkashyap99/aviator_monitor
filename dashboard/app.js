@@ -807,7 +807,7 @@ function renderMlPrediction(mlPrediction, mlRetrain) {
     elements.mlProbabilityList.textContent = mlPrediction && mlPrediction.error
       ? mlPrediction.error
       : "Waiting for trained model";
-    elements.mlModelMeta.textContent = `Run ml_train.py once if model files are missing. ${mlRetrainText(mlRetrain)}`;
+    elements.mlModelMeta.textContent = `Run ml_train.py once if model files are missing. ${mlRetrainText(mlRetrain)} | ${mlLiveMetricText(mlRetrain)}`;
     return;
   }
 
@@ -831,7 +831,7 @@ function renderMlPrediction(mlPrediction, mlRetrain) {
     ? `${formatCount(mlPrediction.data_used_rounds)} rounds`
     : "round count unknown";
   const currentText = mlPrediction.is_current ? "current" : "refreshing";
-  elements.mlModelMeta.textContent = `${roundsText} | ${modelNames.join(", ") || "model"} | ${currentText} | ${mlRetrainText(mlRetrain)}`;
+  elements.mlModelMeta.textContent = `${roundsText} | ${modelNames.join(", ") || "model"} | ${currentText} | ${mlRetrainText(mlRetrain)} | ${mlLiveMetricText(mlRetrain)}`;
 }
 
 function mlRetrainText(mlRetrain) {
@@ -865,6 +865,27 @@ function mlRetrainText(mlRetrain) {
   }
 
   return `Auto learning: next retrain in ${formatCount(remaining)} rounds`;
+}
+
+function mlLiveMetricText(mlRetrain) {
+  const liveMetrics = mlRetrain && mlRetrain.live_metrics
+    ? mlRetrain.live_metrics
+    : {};
+  const metric = (
+    liveMetrics["2.00"] && (
+      liveMetrics["2.00"]["100"]
+      || liveMetrics["2.00"].all
+    )
+  ) || null;
+
+  if (!metric || !metric.predictions) {
+    return "Live score: collecting";
+  }
+
+  const skill = metric.brier_skill === null || metric.brier_skill === undefined
+    ? "--"
+    : formatPercentagePoints(metric.brier_skill);
+  return `Live 2x score: ${formatPercent(metric.accuracy)} over ${formatCount(metric.predictions)} checks, skill ${skill}`;
 }
 
 function formatRoundsAgo(value) {
@@ -1933,6 +1954,7 @@ function buildRenderSignature(data) {
     mlRetrainRemaining: mlRetrain.rounds_until_next_train,
     mlRetrainSuccessAt: mlRetrain.last_success_at,
     mlRetrainError: mlRetrain.last_error,
+    mlLiveMetric: mlLiveMetricText(mlRetrain),
     mlPredictions: mlEntries.map((item) => [
       item.target,
       item.probability,

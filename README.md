@@ -117,12 +117,40 @@ checks every 30 seconds and retrains after 500 new saved rounds:
 
 ```json
 "ml_auto_retrain": true,
-"ml_retrain_min_new_rounds": 500,
+"ml_retrain_every_rounds": 500,
+"ml_minimum_training_rounds": 3000,
+"ml_promotion_min_skill_improvement": 0.005,
 "ml_retrain_check_seconds": 30
 ```
 
 This retraining uses the same fixed walk-forward and holdout rules. It does not
 change thresholds merely because a final holdout result looked poor.
+
+The auto-retrainer uses a champion/challenger flow:
+
+- `models/champion.json` points at the production champion per target.
+- `models/challengers/` stores newly trained candidate runs.
+- `models/archive/` keeps previous promoted model files.
+- `data/ml_training.lock` prevents concurrent training.
+- `data/ml_live_predictions.csv` records true forward-only prediction results.
+
+Challengers are promoted only when they beat the champion on the same
+chronological validation periods and pass Brier skill, balanced accuracy,
+calibration, fold-stability, and holdout checks. If no challenger clearly wins,
+the champion stays unchanged.
+
+Manual controlled retrain:
+
+```bash
+python3 ml_auto_retrain.py --run-once --force --reason manual
+```
+
+Check retraining/champion/live-score status:
+
+```bash
+python3 ml_auto_retrain.py --status
+python3 ml_auto_retrain.py --live-metrics
+```
 
 Useful target-specific backtest:
 
@@ -142,7 +170,9 @@ Artifacts:
 data/ml_report.json
 data/ml_backtest.csv
 data/ml_predictions.json
+data/ml_live_predictions.csv
 models/manifest.json
+models/champion.json
 models/target_*.joblib
 ```
 
@@ -186,6 +216,7 @@ When recent learned profiles do not beat the majority baseline, the dashboard su
 - `ml_backtest.py` - chronological walk-forward validation
 - `ml_train.py` - model selection, final holdout evaluation, and model saving
 - `ml_predict.py` - current next-round ML probability estimates
+- `ml_auto_retrain.py` - controlled retraining, champion promotion, and live ML tracking
 - `ml_report.py` - concise report printer
 - `dashboard.py` - local realtime dashboard server
 - `dashboard/` - dashboard UI files

@@ -19,6 +19,7 @@ ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "data"
 MODELS_DIR = ROOT / "models"
 MANIFEST_PATH = MODELS_DIR / "manifest.json"
+CHAMPION_METADATA_PATH = MODELS_DIR / "champion.json"
 REPORT_PATH = DATA_DIR / "ml_report.json"
 PREDICTIONS_PATH = DATA_DIR / "ml_predictions.json"
 MODEL_VERSION = "ml-research-v1"
@@ -36,6 +37,31 @@ def load_json(path: Path) -> dict:
         return {}
     with Path(path).open("r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def active_model_metadata(manifest_path: Path = MANIFEST_PATH) -> tuple[dict, str]:
+    """Prefer champion metadata, then fall back to the legacy manifest."""
+
+    champion = load_json(CHAMPION_METADATA_PATH)
+    if champion.get("targets"):
+        return champion, "champion"
+
+    return load_json(manifest_path), "legacy"
+
+
+def model_path_for_item(item: dict, manifest_path: Path, source: str) -> Path:
+    """Resolve model paths from either champion or legacy metadata."""
+
+    path_value = item.get("champion_model_path") or item.get("model_path", "")
+    path = Path(path_value)
+
+    if path.is_absolute():
+        return path
+
+    if source == "champion":
+        return ROOT / path
+
+    return Path(manifest_path).parent / path
 
 
 def format_percent(value) -> str:
@@ -82,7 +108,7 @@ def make_predictions(
 ) -> dict:
     """Return current next-round estimates from trained ML artifacts."""
 
-    manifest = load_json(manifest_path)
+    manifest, metadata_source = active_model_metadata(manifest_path)
     report = load_json(report_path)
     if not manifest:
         return {
@@ -142,7 +168,11 @@ def make_predictions(
             from ml_backtest import safe_positive_probability
             from ml_train import load_model
 
-            model_path = Path(manifest_path).parent / item["model_path"]
+            model_path = model_path_for_item(
+                item,
+                manifest_path,
+                metadata_source,
+            )
             estimator = load_model(model_path)
             probability = float(safe_positive_probability(estimator, frame)[0])
 
@@ -156,6 +186,8 @@ def make_predictions(
             "validation_status": validation_metrics.get("validation_status", "UNKNOWN"),
             "holdout_status": holdout_metrics.get("validation_status", "UNKNOWN"),
             "holdout_brier_skill": holdout_metrics.get("brier_skill_score"),
+            "model_version": item.get("version") or manifest.get("model_version"),
+            "model_path": item.get("champion_model_path") or item.get("model_path"),
             "note": (
                 "Probability is useful only if validation/holdout skill beats baseline."
             ),
@@ -163,6 +195,15 @@ def make_predictions(
 
     return {
         "model_version": manifest.get("model_version", MODEL_VERSION),
+        "metadata_source": metadata_source,
+        "champion_version": max(
+            [
+                str(item.get("version", ""))
+                for item in target_items.values()
+                if item.get("version")
+            ]
+            or [""]
+        ),
         "feature_schema_version": manifest.get("feature_schema_version"),
         "data_used_rounds": quality.get("valid_rows"),
         "predictions": predictions,

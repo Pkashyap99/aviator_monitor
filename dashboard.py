@@ -35,6 +35,7 @@ ROUND_CONTEXT_PATH = DATA_DIR / "round_context.csv"
 ML_PREDICTIONS_PATH = DATA_DIR / "ml_predictions.json"
 ML_REPORT_PATH = DATA_DIR / "ml_report.json"
 ML_MANIFEST_PATH = ROOT / "models" / "manifest.json"
+ML_CHAMPION_METADATA_PATH = ROOT / "models" / "champion.json"
 ML_RETRAIN_STATE_PATH = DATA_DIR / "ml_retrain_state.json"
 RANGE_MODEL_VERSION = "adaptive-v8-fine-multilookback"
 DASHBOARD_DIR = ROOT / "dashboard"
@@ -81,6 +82,8 @@ ML_RETRAIN_SETTINGS = {
     "enabled": True,
     "min_new_rounds": 500,
     "check_seconds": 30,
+    "minimum_training_rounds": 3000,
+    "promotion_min_skill_improvement": 0.005,
 }
 DISPLAY_MONEY_REFRESH_SECONDS = 2
 DISPLAY_MONEY_FIELDS = {
@@ -344,6 +347,8 @@ def compact_ml_prediction_payload(payload, round_count):
         "error": payload.get("error"),
         "generated_at": payload.get("generated_at"),
         "model_version": payload.get("model_version"),
+        "metadata_source": payload.get("metadata_source"),
+        "champion_version": payload.get("champion_version"),
         "feature_schema_version": payload.get("feature_schema_version"),
         "data_used_rounds": payload.get("data_used_rounds"),
         "rounds_in_csv": round_count,
@@ -361,6 +366,8 @@ def compact_ml_prediction_payload(payload, round_count):
             "historical_baseline": item.get("historical_baseline"),
             "edge": item.get("edge"),
             "model": item.get("model"),
+            "model_version": item.get("model_version"),
+            "model_path": item.get("model_path"),
             "validation_status": item.get("validation_status"),
             "holdout_status": item.get("holdout_status"),
             "holdout_brier_skill": item.get("holdout_brier_skill"),
@@ -373,6 +380,7 @@ def compact_ml_prediction_payload(payload, round_count):
 def current_ml_prediction(round_count):
     signature = (
         csv_signature(),
+        file_signature(ML_CHAMPION_METADATA_PATH),
         file_signature(ML_MANIFEST_PATH),
         file_signature(ML_REPORT_PATH),
     )
@@ -491,6 +499,36 @@ def output_tail(text, max_lines=35):
 
 
 def ml_retrain_status_snapshot():
+    try:
+        from ml_auto_retrain import scheduler_status
+
+        status = scheduler_status(
+            {
+                "ml_retrain_every_rounds": ML_RETRAIN_SETTINGS["min_new_rounds"],
+                "ml_minimum_training_rounds": ML_RETRAIN_SETTINGS[
+                    "minimum_training_rounds"
+                ],
+                "ml_promotion_min_skill_improvement": ML_RETRAIN_SETTINGS[
+                    "promotion_min_skill_improvement"
+                ],
+            },
+            CSV_PATH,
+        )
+        status["enabled"] = bool(ML_RETRAIN_SETTINGS.get("enabled", True))
+        status["check_seconds"] = int(ML_RETRAIN_SETTINGS.get("check_seconds", 30))
+
+        thread = ML_RETRAIN_STATE.get("thread")
+        if thread and thread.is_alive():
+            status["status"] = "training"
+
+        if not ML_RETRAIN_SETTINGS.get("enabled", True):
+            status["status"] = "disabled"
+
+        return status
+
+    except Exception:
+        pass
+
     settings = dict(ML_RETRAIN_SETTINGS)
     state = load_ml_retrain_state()
     current_rounds = csv_data_row_count()
@@ -558,7 +596,18 @@ def run_ml_retrain(current_rounds):
 
     command = [
         sys.executable,
-        str(ROOT / "ml_train.py"),
+        str(ROOT / "ml_auto_retrain.py"),
+        "--run-once",
+        "--reason",
+        "dashboard",
+        "--csv",
+        str(CSV_PATH),
+        "--retrain-every-rounds",
+        str(ML_RETRAIN_SETTINGS["min_new_rounds"]),
+        "--minimum-training-rounds",
+        str(ML_RETRAIN_SETTINGS["minimum_training_rounds"]),
+        "--promotion-min-skill-improvement",
+        str(ML_RETRAIN_SETTINGS["promotion_min_skill_improvement"]),
     ]
 
     try:
@@ -594,7 +643,7 @@ def run_ml_retrain(current_rounds):
             last_finished_at=now_string(),
             last_returncode=result.returncode,
             last_output_tail=output_tail(combined_output),
-            last_error="ml_train.py failed",
+            last_error="ml_auto_retrain.py failed",
         )
 
     except Exception as exc:
@@ -614,10 +663,30 @@ def maybe_start_ml_retrain():
         )
         return
 
-    current_rounds = csv_data_row_count()
-    last_trained_rounds = infer_last_trained_rounds()
-    min_new_rounds = int(settings.get("min_new_rounds", 500))
-    new_rounds = current_rounds - last_trained_rounds
+    try:
+        from ml_auto_retrain import should_retrain
+
+        retrain_due, reason, status = should_retrain(
+            {
+                "ml_retrain_every_rounds": settings.get("min_new_rounds", 500),
+                "ml_minimum_training_rounds": settings.get(
+                    "minimum_training_rounds",
+                    3000,
+                ),
+                "ml_promotion_min_skill_improvement": settings.get(
+                    "promotion_min_skill_improvement",
+                    0.005,
+                ),
+            },
+            CSV_PATH,
+        )
+        current_rounds = status.get("current_rounds", 0)
+        last_trained_rounds = status.get("last_trained_rounds", 0)
+    except Exception:
+        retrain_due = False
+        reason = "scheduler unavailable"
+        current_rounds = csv_data_row_count()
+        last_trained_rounds = infer_last_trained_rounds()
 
     with ML_RETRAIN_LOCK:
         thread = ML_RETRAIN_STATE.get("thread")
@@ -630,20 +699,12 @@ def maybe_start_ml_retrain():
             )
             return
 
-        if current_rounds <= 0:
-            update_ml_retrain_status(
-                status="waiting_for_data",
-                current_rounds=current_rounds,
-                last_trained_rounds=last_trained_rounds,
-            )
-            return
-
-        if new_rounds < min_new_rounds:
+        if not retrain_due:
             update_ml_retrain_status(
                 status="waiting",
                 current_rounds=current_rounds,
                 last_trained_rounds=last_trained_rounds,
-                rounds_until_next_train=max(0, min_new_rounds - new_rounds),
+                message=reason,
             )
             return
 
@@ -656,12 +717,23 @@ def maybe_start_ml_retrain():
         thread.start()
 
 
-def start_ml_auto_retrainer(enabled=True, min_new_rounds=500, check_seconds=30):
+def start_ml_auto_retrainer(
+    enabled=True,
+    min_new_rounds=500,
+    check_seconds=30,
+    minimum_training_rounds=3000,
+    promotion_min_skill_improvement=0.005,
+):
     ML_RETRAIN_SETTINGS.update(
         {
             "enabled": bool(enabled),
             "min_new_rounds": max(1, int(min_new_rounds)),
             "check_seconds": max(5, int(check_seconds)),
+            "minimum_training_rounds": max(100, int(minimum_training_rounds)),
+            "promotion_min_skill_improvement": max(
+                0.0,
+                float(promotion_min_skill_improvement),
+            ),
         }
     )
 
@@ -2683,6 +2755,7 @@ def build_dashboard_payload(query, include_backtests=True):
             CONFIG_PATH
         )
         current_ml_signature = (
+            file_signature(ML_CHAMPION_METADATA_PATH),
             file_signature(ML_MANIFEST_PATH),
             file_signature(ML_REPORT_PATH),
         )
@@ -2780,6 +2853,16 @@ def build_dashboard_payload(query, include_backtests=True):
         payload["ml_prediction"] = current_ml_prediction(
             len(all_rounds)
         )
+        try:
+            from ml_auto_retrain import update_live_prediction_tracking
+
+            update_live_prediction_tracking(
+                rounds,
+                payload["ml_prediction"],
+                source="dashboard",
+            )
+        except Exception:
+            pass
         payload["ml_retrain"] = ml_retrain_status_snapshot()
         payload["_cached_at"] = time.monotonic()
 
@@ -2962,6 +3045,18 @@ def main():
         help="Retrain after this many new CSV rounds since the last successful ML train.",
     )
     parser.add_argument(
+        "--ml-minimum-training-rounds",
+        type=int,
+        default=None,
+        help="Minimum valid rounds required before ML retraining can run.",
+    )
+    parser.add_argument(
+        "--ml-promotion-min-skill-improvement",
+        type=float,
+        default=None,
+        help="Minimum Brier skill improvement required to promote a challenger.",
+    )
+    parser.add_argument(
         "--ml-retrain-check-seconds",
         type=int,
         default=None,
@@ -2980,8 +3075,31 @@ def main():
         if args.ml_retrain_min_new_rounds is not None
         else int(
             config.get(
-                "ml_retrain_min_new_rounds",
-                500,
+                "ml_retrain_every_rounds",
+                config.get(
+                    "ml_retrain_min_new_rounds",
+                    500,
+                ),
+            )
+        )
+    )
+    ml_minimum_training_rounds = (
+        args.ml_minimum_training_rounds
+        if args.ml_minimum_training_rounds is not None
+        else int(
+            config.get(
+                "ml_minimum_training_rounds",
+                3000,
+            )
+        )
+    )
+    ml_promotion_min_skill_improvement = (
+        args.ml_promotion_min_skill_improvement
+        if args.ml_promotion_min_skill_improvement is not None
+        else float(
+            config.get(
+                "ml_promotion_min_skill_improvement",
+                0.005,
             )
         )
     )
@@ -3005,6 +3123,8 @@ def main():
         enabled=ml_auto_retrain_enabled,
         min_new_rounds=ml_retrain_min_new_rounds,
         check_seconds=ml_retrain_check_seconds,
+        minimum_training_rounds=ml_minimum_training_rounds,
+        promotion_min_skill_improvement=ml_promotion_min_skill_improvement,
     )
 
     print(f"Dashboard running at http://{args.host}:{args.port}")
