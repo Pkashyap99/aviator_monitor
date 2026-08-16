@@ -95,6 +95,14 @@ PAGE_READ_TIMEOUT_SECONDS = 1.0
 
 SLOW_CONTEXT_READ_TIMEOUT_SECONDS = 1.5
 
+DEFAULT_NO_VISIBLE_RECOVERY_SECONDS = 20
+
+DEFAULT_NO_VISIBLE_RECOVERY_COOLDOWN_SECONDS = 60
+
+DEFAULT_PAGE_RELOAD_TIMEOUT_SECONDS = 12
+
+DEFAULT_PAGE_RELOAD_SETTLE_SECONDS = 3
+
 
 # =========================================================
 # MULTIPLIER REGEX
@@ -182,6 +190,33 @@ PARTICIPANT_HEARTBEAT_SECONDS = 30
 PARTICIPANT_TABLE_SCAN_SECONDS = 1
 
 PARTICIPANT_TABLE_HEARTBEAT_SECONDS = 2
+
+GAME_STATUS_SCAN_SECONDS = 0.1
+
+GAME_STATUS_MIN_WRITE_SECONDS = 0.25
+
+GAME_STATUS_HEARTBEAT_SECONDS = 5
+
+LIVE_MULTIPLIER_SELECTORS = [
+    ".layout-info .game-score",
+    ".game-score",
+]
+
+ROUND_STATE_PATTERN = re.compile(r"STATE_(?:START|RUN|FINISH)")
+
+WS_TOKEN_ENDPOINT_MARKER = "getwstoken"
+
+WS_TOKEN_CHANNEL_KEYS = {
+    "userchannel": "private user",
+    "betschannel": "bets",
+    "gamechannel": "game state",
+    "integrationchannel": "integration",
+    "assetschannel": "assets",
+    "gameassetschannel": "game assets",
+    "participantschannel": "participants",
+    "participantsanonymizedchannel": "participants",
+    "bonuseschannel": "bonuses",
+}
 
 
 # =========================================================
@@ -517,6 +552,61 @@ def normalize_payload_key(key):
         "",
         str(key).lower()
     )
+
+
+def ws_token_channel_summary(payload):
+    if not isinstance(
+        payload,
+        dict
+    ):
+        return None
+
+    detected = []
+    labels = []
+
+    for key, value in payload.items():
+        normalized = normalize_payload_key(
+            key
+        )
+
+        if (
+            normalized not in WS_TOKEN_CHANNEL_KEYS
+            or value in (
+                None,
+                "",
+            )
+        ):
+            continue
+
+        detected.append(
+            str(
+                key
+            )
+        )
+
+        label = WS_TOKEN_CHANNEL_KEYS[normalized]
+
+        if label not in labels:
+            labels.append(
+                label
+            )
+
+    if not detected:
+        return None
+
+    return {
+        "observed_at": now_string(),
+        "detected_keys": sorted(
+            detected
+        ),
+        "labels": sorted(
+            labels
+        ),
+        "total": len(
+            detected
+        ),
+        "secrets_saved": False,
+    }
 
 
 def direct_payload_value(mapping, aliases):
@@ -1482,12 +1572,26 @@ def load_state():
         return {}
 
 
-def save_state(snapshot):
+def save_state(snapshot=None, game_status=None, realtime_channels=None):
 
-    data = {
-        "last_updated": now_string(),
-        "snapshot": snapshot
-    }
+    data = load_state()
+
+    if not isinstance(
+        data,
+        dict
+    ):
+        data = {}
+
+    data["last_updated"] = now_string()
+
+    if snapshot is not None:
+        data["snapshot"] = snapshot
+
+    if game_status is not None:
+        data["game_status"] = game_status
+
+    if realtime_channels is not None:
+        data["realtime_channels"] = realtime_channels
 
     tmp_path = STATE_PATH.with_suffix(".json.tmp")
 
@@ -1510,6 +1614,123 @@ def save_state(snapshot):
     tmp_path.replace(
         STATE_PATH
     )
+
+
+def phase_from_round_state(round_state, is_preparing=None):
+    if round_state == "STATE_RUN":
+        return "running"
+
+    if round_state == "STATE_FINISH":
+        return "finished"
+
+    if is_preparing:
+        return "preparing"
+
+    if round_state == "STATE_START":
+        return "starting"
+
+    return None
+
+
+def parse_bool_text(value):
+    if isinstance(value, bool):
+        return value
+
+    lowered = str(
+        value
+    ).strip().lower()
+
+    if lowered == "true":
+        return True
+
+    if lowered == "false":
+        return False
+
+    return None
+
+
+def parse_console_game_status_text(text):
+    text = str(
+        text or ""
+    )
+
+    if "GameTimer" not in text and "STATE_" not in text:
+        return None
+
+    match = ROUND_STATE_PATTERN.search(
+        text
+    )
+    round_state = match.group(0) if match else None
+
+    is_preparing = None
+    preparing_match = re.search(
+        r"isPreparing:\s*(true|false)",
+        text,
+        re.IGNORECASE
+    )
+
+    if preparing_match:
+        is_preparing = parse_bool_text(
+            preparing_match.group(1)
+        )
+
+    if (
+        "Prepare done" in text
+        and round_state is None
+    ):
+        round_state = "STATE_START"
+        is_preparing = False
+
+    phase = phase_from_round_state(
+        round_state,
+        is_preparing
+    )
+
+    if not phase:
+        return None
+
+    return {
+        "phase": phase,
+        "round_state": round_state,
+        "is_preparing": is_preparing,
+        "source": "console",
+    }
+
+
+def parse_console_game_status_value(value):
+    if not isinstance(
+        value,
+        dict
+    ):
+        return None
+
+    round_state = value.get(
+        "roundState"
+    )
+    is_preparing = value.get(
+        "isPreparing"
+    )
+
+    if (
+        not round_state
+        and is_preparing is None
+    ):
+        return None
+
+    phase = phase_from_round_state(
+        round_state,
+        is_preparing
+    )
+
+    if not phase:
+        return None
+
+    return {
+        "phase": phase,
+        "round_state": round_state,
+        "is_preparing": is_preparing,
+        "source": "console",
+    }
 
 
 # =========================================================
@@ -2357,6 +2578,166 @@ async def drain_history_watcher(page):
         return None
 
 
+async def install_game_status_watcher(page):
+    await page.evaluate(
+        """
+        ({ selectors, intervalMs }) => {
+          if (window.__aviatorMonitorGameStatus?.timer) {
+            clearInterval(window.__aviatorMonitorGameStatus.timer);
+          }
+
+          if (window.__aviatorMonitorGameStatus?.observer) {
+            window.__aviatorMonitorGameStatus.observer.disconnect();
+          }
+
+          const readLiveMultiplier = () => {
+            for (const selector of selectors) {
+              const node = document.querySelector(selector);
+
+              if (!node) {
+                continue;
+              }
+
+              const rect = node.getBoundingClientRect();
+              const style = window.getComputedStyle(node);
+
+              if (
+                rect.width <= 0
+                || rect.height <= 0
+                || style.visibility === "hidden"
+                || style.display === "none"
+              ) {
+                continue;
+              }
+
+              const chars = Array.from(
+                node.querySelectorAll("[data-char]")
+              ).map((item) => item.getAttribute("data-char") || "").join("");
+              const text = (chars || node.innerText || node.textContent || "").trim();
+              const match = text.match(/(\\d+(?:\\.\\d+)?)\\s*x?/i);
+
+              if (!match) {
+                continue;
+              }
+
+              const value = Number.parseFloat(match[1]);
+
+              if (!Number.isFinite(value) || value < 1) {
+                continue;
+              }
+
+              return Math.round(value * 100) / 100;
+            }
+
+            return null;
+          };
+
+          window.__aviatorMonitorGameStatus = {
+            liveMultiplier: null,
+            phase: null,
+            source: null,
+            updatedAt: null,
+            reads: 0,
+            misses: 0,
+            timer: null,
+            observer: null,
+            pendingMutationTick: false,
+          };
+
+          const tick = () => {
+            const state = window.__aviatorMonitorGameStatus;
+            const multiplier = readLiveMultiplier();
+            state.reads += 1;
+            state.updatedAt = Date.now();
+
+            if (multiplier === null) {
+              state.misses += 1;
+              state.liveMultiplier = null;
+              return;
+            }
+
+            state.liveMultiplier = multiplier;
+            state.phase = "running";
+            state.source = "live_score_dom";
+          };
+
+          const scheduleImmediateTick = () => {
+            const state = window.__aviatorMonitorGameStatus;
+
+            if (!state || state.pendingMutationTick) {
+              return;
+            }
+
+            state.pendingMutationTick = true;
+
+            window.setTimeout(() => {
+              const latestState = window.__aviatorMonitorGameStatus;
+
+              if (!latestState) {
+                return;
+              }
+
+              latestState.pendingMutationTick = false;
+              tick();
+            }, 10);
+          };
+
+          window.__aviatorMonitorGameStatus.observer = new MutationObserver(
+            scheduleImmediateTick
+          );
+
+          window.__aviatorMonitorGameStatus.observer.observe(
+            document.body,
+            {
+              childList: true,
+              subtree: true,
+              characterData: true,
+            }
+          );
+
+          tick();
+          window.__aviatorMonitorGameStatus.timer = setInterval(tick, intervalMs);
+        }
+        """,
+        {
+            "selectors": LIVE_MULTIPLIER_SELECTORS,
+            "intervalMs": int(
+                GAME_STATUS_SCAN_SECONDS * 1000
+            ),
+        }
+    )
+
+    log(
+        "Installed game status watcher."
+    )
+
+
+async def read_game_status_watcher(page):
+    try:
+        return await page.evaluate(
+            """
+            () => {
+              const state = window.__aviatorMonitorGameStatus;
+
+              if (!state) {
+                return null;
+              }
+
+              return {
+                phase: state.phase || null,
+                liveMultiplier: state.liveMultiplier,
+                source: state.source,
+                updatedAt: state.updatedAt,
+                reads: state.reads || 0,
+                misses: state.misses || 0,
+              };
+            }
+            """
+        )
+    except Exception:
+        return None
+
+
 def extract_round_ids(value):
     round_ids = []
 
@@ -2640,18 +3021,45 @@ async def install_round_id_observer(page, collect_round_context=True):
 
     async def handle_response(response):
         response_url = response.url
+        is_ws_token_response = (
+            WS_TOKEN_ENDPOINT_MARKER
+            in response_url.lower()
+        )
         source_label = response_source_label(
             response_url
         )
 
-        if not response_may_have_round_context(
-            response_url
+        if (
+            not is_ws_token_response
+            and not response_may_have_round_context(
+                response_url
+            )
         ):
             return
 
         try:
             payload = await response.json()
         except Exception:
+            return
+
+        if is_ws_token_response:
+            channel_summary = ws_token_channel_summary(
+                payload
+            )
+
+            if channel_summary:
+                save_state(
+                    realtime_channels=channel_summary
+                )
+                log(
+                    "Detected realtime channels: "
+                    f"{', '.join(channel_summary['labels'])}. "
+                    "Token values were not saved."
+                )
+
+        if not response_may_have_round_context(
+            response_url
+        ):
             return
 
         payload = attach_request_round_id(
@@ -3439,7 +3847,12 @@ async def monitor_page(
     minimum_new_round_gap_seconds,
     required_source=None,
     collect_round_context=True,
-    participant_count_selector=DEFAULT_PARTICIPANT_COUNT_SELECTOR
+    participant_count_selector=DEFAULT_PARTICIPANT_COUNT_SELECTOR,
+    auto_recover_no_visible=True,
+    no_visible_recovery_seconds=DEFAULT_NO_VISIBLE_RECOVERY_SECONDS,
+    no_visible_recovery_cooldown_seconds=DEFAULT_NO_VISIBLE_RECOVERY_COOLDOWN_SECONDS,
+    page_reload_timeout_seconds=DEFAULT_PAGE_RELOAD_TIMEOUT_SECONDS,
+    page_reload_settle_seconds=DEFAULT_PAGE_RELOAD_SETTLE_SECONDS
 ):
 
     current_source = page_source(
@@ -3477,9 +3890,17 @@ async def monitor_page(
         previous_snapshot
     )
 
+    await install_game_status_watcher(
+        page
+    )
+
     last_heartbeat = time.time()
 
     last_no_visible_log = 0
+
+    no_visible_since = None
+
+    last_no_visible_recovery_at = 0
 
     no_overlap_count = 0
 
@@ -3503,6 +3924,46 @@ async def monitor_page(
 
     last_participant_table_log_at = 0
 
+    persisted_state = load_state()
+
+    game_status = (
+        persisted_state.get(
+            "game_status",
+            {}
+        )
+        if isinstance(
+            persisted_state,
+            dict
+        )
+        else {}
+    )
+
+    if not isinstance(
+        game_status,
+        dict
+    ):
+        game_status = {}
+
+    game_status_event_id = int(
+        game_status.get(
+            "event_id",
+            0
+        )
+        or 0
+    )
+
+    last_game_status_scan = 0
+
+    last_game_status_write_at = 0
+
+    last_game_status_signature = None
+
+    last_handled_finish_event_id = game_status.get(
+        "finish_event_id"
+    )
+
+    last_finish_force_at = 0
+
     observed_seed_pairs = load_observed_seed_pairs()
 
     last_appended_multiplier = None
@@ -3521,6 +3982,164 @@ async def monitor_page(
         "Live monitoring started "
         f"(watcher drain every {fast_poll_seconds:.2f}s, "
         f"snapshot scan every {snapshot_scan_seconds:.2f}s)."
+    )
+
+    def update_game_status(update):
+        nonlocal game_status
+        nonlocal game_status_event_id
+
+        if not update:
+            return
+
+        previous_phase = game_status.get(
+            "phase"
+        )
+        previous_round_state = game_status.get(
+            "round_state"
+        )
+        next_status = dict(
+            game_status
+        )
+        next_status.update(
+            update
+        )
+
+        if (
+            update.get("source") == "live_score_dom"
+            and update.get("phase") == "running"
+        ):
+            next_status["round_state"] = "STATE_RUN"
+            next_status["is_preparing"] = False
+
+        if "liveMultiplier" in next_status:
+            next_status["live_multiplier"] = next_status.pop(
+                "liveMultiplier"
+            )
+
+        next_status["observed_at"] = now_string()
+        next_status["game_source"] = current_source
+
+        phase_changed = (
+            next_status.get(
+                "phase"
+            )
+            != previous_phase
+        )
+        round_state_changed = (
+            next_status.get(
+                "round_state"
+            )
+            and next_status.get(
+                "round_state"
+            )
+            != previous_round_state
+        )
+
+        if phase_changed or round_state_changed:
+            game_status_event_id += 1
+            next_status["event_id"] = game_status_event_id
+            next_status["phase_started_at"] = next_status["observed_at"]
+
+        if next_status.get("phase") == "finished":
+            next_status["last_finish_at"] = next_status["observed_at"]
+            next_status["finish_event_id"] = game_status_event_id
+            next_status["live_multiplier"] = None
+
+        if next_status.get("phase") == "running":
+            next_status["last_run_at"] = next_status["observed_at"]
+
+        game_status = next_status
+
+    def game_status_signature():
+        try:
+            return json.dumps(
+                game_status,
+                sort_keys=True
+            )
+        except TypeError:
+            return str(
+                game_status
+            )
+
+    def persist_game_status_if_needed(force=False):
+        nonlocal last_game_status_signature
+        nonlocal last_game_status_write_at
+
+        if not game_status:
+            return
+
+        current_time = time.monotonic()
+        signature = game_status_signature()
+        changed = signature != last_game_status_signature
+        heartbeat_due = (
+            current_time - last_game_status_write_at
+            >= GAME_STATUS_HEARTBEAT_SECONDS
+        )
+        minimum_gap_passed = (
+            current_time - last_game_status_write_at
+            >= GAME_STATUS_MIN_WRITE_SECONDS
+        )
+
+        if not force and not (
+            heartbeat_due
+            or (
+                changed
+                and minimum_gap_passed
+            )
+        ):
+            return
+
+        save_state(
+            previous_snapshot,
+            game_status
+        )
+        last_game_status_signature = signature
+        last_game_status_write_at = current_time
+
+    async def handle_console_message(message):
+        message_text = getattr(
+            message,
+            "text",
+            ""
+        )
+
+        if callable(
+            message_text
+        ):
+            try:
+                message_text = message_text()
+            except Exception:
+                message_text = ""
+
+        update_game_status(
+            parse_console_game_status_text(
+                message_text
+            )
+        )
+
+        for arg in getattr(
+            message,
+            "args",
+            []
+        ) or []:
+            try:
+                value = await arg.json_value()
+            except Exception:
+                continue
+
+            update_game_status(
+                parse_console_game_status_value(
+                    value
+                )
+            )
+
+    page.on(
+        "console",
+        lambda message: asyncio.create_task(
+            handle_console_message(
+                message
+            )
+        )
     )
 
     def append_live_round(multiplier, timestamp=None, round_id=None):
@@ -3550,6 +4169,144 @@ async def monitor_page(
 
         log(
             f"NEW ROUND: {multiplier:.2f}x"
+        )
+
+    async def recover_no_visible_multipliers():
+        nonlocal previous_snapshot
+        nonlocal no_overlap_count
+        nonlocal no_visible_since
+        nonlocal last_no_visible_recovery_at
+        nonlocal last_snapshot_scan
+        nonlocal last_seed_scan
+        nonlocal last_game_status_scan
+        nonlocal current_source
+
+        current_time = time.monotonic()
+        seconds_hidden = (
+            current_time - no_visible_since
+            if no_visible_since is not None
+            else 0
+        )
+
+        last_no_visible_recovery_at = current_time
+
+        log(
+            "WARNING: Multiplier history has been invisible for "
+            f"{seconds_hidden:.1f}s. Auto-reloading the Aviatrix tab."
+        )
+
+        await page_read_with_timeout(
+            page.reload(
+                wait_until="domcontentloaded",
+                timeout=page_reload_timeout_seconds * 1000
+            ),
+            page_reload_timeout_seconds + 2,
+            default=None
+        )
+
+        await asyncio.sleep(
+            page_reload_settle_seconds
+        )
+
+        live_source = page_source(
+            page.url
+        )
+
+        if not source_matches_required(
+            live_source,
+            required_source
+        ):
+            raise RuntimeError(
+                "Required round source changed during auto-recovery."
+            )
+
+        current_source = live_source
+
+        recovered_snapshot = await page_read_with_timeout(
+            read_multipliers_reliably(
+                page,
+                selector,
+                attempts=8,
+                delay_seconds=0.5
+            ),
+            max(
+                page_reload_timeout_seconds,
+                PAGE_READ_TIMEOUT_SECONDS * 8
+            ),
+            default=[]
+        )
+
+        if not recovered_snapshot:
+            log(
+                "WARNING: Auto-reload did not restore visible multipliers. "
+                "Reconnecting collector."
+            )
+
+            raise RuntimeError(
+                "Auto-recovery could not restore visible multipliers."
+            )
+
+        recovered_values = []
+
+        if previous_snapshot:
+            recovered_values = find_new_values(
+                previous_snapshot,
+                recovered_snapshot
+            )
+
+        if not recovered_values:
+            recovered_values = recover_new_values_from_recent_csv(
+                recovered_snapshot,
+                load_recent_round_values()
+            )
+
+        if recovered_values:
+            if len(recovered_values) > MAX_NEW_VALUES_PER_SCAN:
+                log(
+                    "WARNING: Auto-recovery found "
+                    f"{len(recovered_values)} possible new rounds, above safe "
+                    f"limit of {MAX_NEW_VALUES_PER_SCAN}. Resetting snapshot "
+                    "without appending old history."
+                )
+            else:
+                log(
+                    "Auto-recovery recovered "
+                    f"{len(recovered_values)} missed rounds from visible history."
+                )
+
+                for multiplier in reversed(
+                    recovered_values
+                ):
+                    append_live_round(
+                        multiplier
+                    )
+
+        previous_snapshot = recovered_snapshot
+
+        save_state(
+            previous_snapshot,
+            game_status
+        )
+
+        await install_history_watcher(
+            page,
+            selector,
+            previous_snapshot
+        )
+
+        await install_game_status_watcher(
+            page
+        )
+
+        no_overlap_count = 0
+        no_visible_since = None
+        last_snapshot_scan = 0
+        last_seed_scan = 0
+        last_game_status_scan = 0
+
+        log(
+            "Auto-recovery restored multiplier visibility "
+            f"({len(previous_snapshot)} visible multipliers)."
         )
 
     async def flush_history_watcher_queue():
@@ -3624,7 +4381,8 @@ async def monitor_page(
         )
 
         save_state(
-            previous_snapshot
+            previous_snapshot,
+            game_status
         )
 
         no_overlap_count = 0
@@ -3654,6 +4412,43 @@ async def monitor_page(
                 )
 
             current_source = live_source
+
+            if time.time() - last_game_status_scan >= GAME_STATUS_SCAN_SECONDS:
+                last_game_status_scan = time.time()
+
+                watcher_status = await page_read_with_timeout(
+                    read_game_status_watcher(
+                        page
+                    ),
+                    PAGE_READ_TIMEOUT_SECONDS,
+                    default=None
+                )
+
+                if watcher_status:
+                    update_game_status(
+                        watcher_status
+                    )
+
+                persist_game_status_if_needed()
+
+            finish_event_id = game_status.get(
+                "finish_event_id"
+            )
+
+            if (
+                finish_event_id
+                and finish_event_id != last_handled_finish_event_id
+            ):
+                last_handled_finish_event_id = finish_event_id
+                current_time = time.monotonic()
+
+                if current_time - last_finish_force_at >= 1:
+                    last_finish_force_at = current_time
+                    last_snapshot_scan = 0
+
+                    log(
+                        "Detected finished round state; forcing immediate history read."
+                    )
 
             await flush_history_watcher_queue()
 
@@ -3817,6 +4612,7 @@ async def monitor_page(
                         )
 
             if current_snapshot:
+                no_visible_since = None
 
                 if previous_snapshot:
 
@@ -3917,10 +4713,17 @@ async def monitor_page(
                 previous_snapshot = current_snapshot
 
                 save_state(
-                    current_snapshot
+                    current_snapshot,
+                    game_status
                 )
 
             elif did_snapshot_scan:
+                current_time = time.monotonic()
+
+                if no_visible_since is None:
+                    no_visible_since = current_time
+
+                no_visible_elapsed = current_time - no_visible_since
 
                 if time.time() - last_no_visible_log >= 5:
 
@@ -3929,6 +4732,14 @@ async def monitor_page(
                     )
 
                     last_no_visible_log = time.time()
+
+                if (
+                    auto_recover_no_visible
+                    and no_visible_elapsed >= no_visible_recovery_seconds
+                    and current_time - last_no_visible_recovery_at
+                    >= no_visible_recovery_cooldown_seconds
+                ):
+                    await recover_no_visible_multipliers()
 
             # Heartbeat
 
@@ -4035,6 +4846,41 @@ async def main():
         DEFAULT_PARTICIPANT_COUNT_SELECTOR
     )
 
+    auto_recover_no_visible = bool(
+        cfg.get(
+            "auto_recover_no_visible",
+            True
+        )
+    )
+
+    no_visible_recovery_seconds = float(
+        cfg.get(
+            "no_visible_recovery_seconds",
+            DEFAULT_NO_VISIBLE_RECOVERY_SECONDS
+        )
+    )
+
+    no_visible_recovery_cooldown_seconds = float(
+        cfg.get(
+            "no_visible_recovery_cooldown_seconds",
+            DEFAULT_NO_VISIBLE_RECOVERY_COOLDOWN_SECONDS
+        )
+    )
+
+    page_reload_timeout_seconds = float(
+        cfg.get(
+            "page_reload_timeout_seconds",
+            DEFAULT_PAGE_RELOAD_TIMEOUT_SECONDS
+        )
+    )
+
+    page_reload_settle_seconds = float(
+        cfg.get(
+            "page_reload_settle_seconds",
+            DEFAULT_PAGE_RELOAD_SETTLE_SECONDS
+        )
+    )
+
     log(
         "=================================="
     )
@@ -4054,6 +4900,13 @@ async def main():
 
     log(
         f"Participant count selector: {participant_count_selector}"
+    )
+
+    log(
+        "Auto recovery: "
+        f"{'enabled' if auto_recover_no_visible else 'disabled'} "
+        f"(no visible threshold {no_visible_recovery_seconds:.1f}s, "
+        f"cooldown {no_visible_recovery_cooldown_seconds:.1f}s)."
     )
 
     async with async_playwright() as p:
@@ -4125,7 +4978,12 @@ async def main():
                     minimum_new_round_gap_seconds,
                     required_source,
                     collect_round_context,
-                    participant_count_selector
+                    participant_count_selector,
+                    auto_recover_no_visible,
+                    no_visible_recovery_seconds,
+                    no_visible_recovery_cooldown_seconds,
+                    page_reload_timeout_seconds,
+                    page_reload_settle_seconds
                 )
 
             except KeyboardInterrupt:

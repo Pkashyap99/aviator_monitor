@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Aviator Predictor</title>
-    <link rel="stylesheet" href="/styles.css?v=20260811-ml-ui">
+    <link rel="stylesheet" href="/styles.css?v=20260815-strategy-audit">
   </head>
   <body>
     <main class="shell">
@@ -14,7 +14,7 @@
           <strong id="fastPredictionText">Waiting for data</strong>
           <small id="signalStrengthText" class="signal-strength">Confidence: waiting</small>
           <span id="fastPredictionMeta">--</span>
-          <small id="bigWatchText" class="big-watch">High round chance: --</small>
+          <small id="bigWatchText" class="big-watch">Big round alert: --</small>
         </div>
         <div class="fast-side">
           <span>Status</span>
@@ -37,20 +37,64 @@
           <strong id="previousPredictionStatus" class="previous-status">Waiting</strong>
           <div id="trackingSummary" class="tracking-summary"></div>
           <div id="sourceModeText" class="source-mode">Data: checking</div>
+          <div id="collectorStatusText" class="collector-status">Game: waiting</div>
           <div id="roundContextText" class="context-mode">Context: waiting</div>
           <div id="accuracySummaryText" class="accuracy-summary">Accuracy: waiting</div>
           <div id="selfLearningText" class="self-learning">Learning: waiting</div>
+        </article>
+        <article id="signalQualityPanel" class="panel signal-quality-panel">
+          <p class="eyebrow">Signal quality</p>
+          <strong id="signalQualityStatus" class="signal-quality-status">Checking</strong>
+          <div id="signalQualityMain" class="signal-quality-main">Waiting for model checks</div>
+          <div id="signalQualityReasons" class="signal-quality-reasons"></div>
+        </article>
+        <article id="dataQualityPanel" class="panel data-quality-panel">
+          <p class="eyebrow">Data health</p>
+          <strong id="dataQualityStatus" class="data-quality-status">Checking</strong>
+          <div id="dataQualityMain" class="data-quality-main">Waiting for data audit</div>
+          <div id="dataQualityIssues" class="data-quality-issues"></div>
+        </article>
+        <article id="sequenceWatchPanel" class="panel sequence-watch-panel">
+          <p class="eyebrow">Big multiplier watch</p>
+          <strong id="sequenceWatchStatus" class="sequence-watch-status">Checking</strong>
+          <div id="sequenceWatchMain" class="sequence-watch-main">Checking recent pattern</div>
+          <div id="sequenceWatchList" class="sequence-watch-list"></div>
+        </article>
+        <article id="aiWatchPanel" class="panel ai-watch-panel">
+          <p class="eyebrow">AI watch</p>
+          <strong id="aiWatchStatus" class="ai-watch-status">Checking</strong>
+          <div id="aiWatchMain" class="ai-watch-main">Waiting for audit</div>
+          <div id="aiWatchList" class="ai-watch-list"></div>
         </article>
         <article id="bigRoundPanel" class="panel big-round-panel">
           <p class="eyebrow">Big rounds</p>
           <strong id="bigRoundStatus" class="big-round-status">Waiting</strong>
           <div id="bigRoundList" class="big-round-list"></div>
         </article>
+        <article id="timingPanel" class="panel timing-panel">
+          <p class="eyebrow">Timing check</p>
+          <strong id="timingStatus" class="timing-status">Checking</strong>
+          <div id="timingSummary" class="timing-summary">Historical timing only</div>
+          <div id="timingList" class="timing-list"></div>
+        </article>
         <article id="mlPredictionPanel" class="panel ml-panel">
           <p class="eyebrow">ML check</p>
           <strong id="mlModelStatus" class="ml-model-status">Waiting</strong>
           <div id="mlProbabilityList" class="ml-probability-list"></div>
           <div id="mlModelMeta" class="ml-model-meta">--</div>
+        </article>
+        <article id="modelHealthPanel" class="panel model-health-panel">
+          <p class="eyebrow">Model health</p>
+          <strong id="modelHealthStatus" class="model-health-status">Checking</strong>
+          <div id="modelHealthSummary" class="model-health-summary">Waiting for learning status</div>
+          <div id="modelHealthMetrics" class="model-health-metrics"></div>
+          <div id="modelHealthBigList" class="model-health-big-list"></div>
+        </article>
+        <article id="strategyAuditPanel" class="panel strategy-audit-panel">
+          <p class="eyebrow">Strategy audit</p>
+          <strong id="strategyAuditStatus" class="strategy-audit-status">Checking</strong>
+          <div id="strategyAuditSummary" class="strategy-audit-summary">Testing cashout strategies</div>
+          <div id="strategyAuditList" class="strategy-audit-list"></div>
         </article>
       </section>
 
@@ -102,6 +146,6 @@
       </section>
     </main>
 
-    <script src="/app.js?v=20260811-ml-ui"></script>
+    <script src="/app.js?v=20260815-strategy-audit"></script>
   </body>
 </html>

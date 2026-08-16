@@ -8,7 +8,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import parse_qs, urlparse
 
 from aviator_analyzer import (
@@ -32,6 +32,10 @@ PREDICTION_HISTORY_PATH = DATA_DIR / "prediction_history.csv"
 RANGE_PREDICTION_HISTORY_PATH = DATA_DIR / "range_prediction_history.csv"
 RANGE_MODEL_HISTORY_PATH = DATA_DIR / "range_model_history.csv"
 ROUND_CONTEXT_PATH = DATA_DIR / "round_context.csv"
+COLLECTOR_STATE_PATH = DATA_DIR / "state.json"
+EDGE_AUDIT_PATH = DATA_DIR / "edge_audit.json"
+PATTERN_DISCOVERY_PATH = DATA_DIR / "pattern_discovery.json"
+STRATEGY_AUDIT_PATH = DATA_DIR / "strategy_audit.json"
 ML_PREDICTIONS_PATH = DATA_DIR / "ml_predictions.json"
 ML_REPORT_PATH = DATA_DIR / "ml_report.json"
 ML_MANIFEST_PATH = ROOT / "models" / "manifest.json"
@@ -42,11 +46,25 @@ DASHBOARD_DIR = ROOT / "dashboard"
 TRACKED_TARGETS = [1.5, 2.0, 3.0, 5.0, 10.0, 20.0, 25.0, 50.0, 100.0]
 BIG_MULTIPLIER_TARGETS = [10.0, 20.0, 50.0, 100.0]
 BIG_MULTIPLIER_RECENT_LIMIT = 8
+TIMING_TARGETS = [2.0, 5.0, 10.0]
+TIMING_MIN_ROUNDS = 500
+TIMING_MIN_BUCKET_ROUNDS = 50
+TIMING_TOP_LIMIT = 5
+WEEKDAY_LABELS = [
+    "Mon",
+    "Tue",
+    "Wed",
+    "Thu",
+    "Fri",
+    "Sat",
+    "Sun",
+]
 TRACKING_LOCK = threading.Lock()
 BACKTEST_LOCK = threading.Lock()
 DISPLAY_MONEY_LOCK = threading.Lock()
 ML_PREDICTION_LOCK = threading.Lock()
 ML_RETRAIN_LOCK = threading.Lock()
+EDGE_AUDIT_LOCK = threading.Lock()
 DASHBOARD_CACHE = {}
 CACHE_MAX_ITEMS = 12
 ACCURACY_SUMMARY_CACHE = {
@@ -60,6 +78,17 @@ RECENT_CONTEXT_MAX_BYTES = 1024 * 1024
 ACTIONABLE_LEADERBOARD_MAXIMUM = 3.0
 MIN_LEADERBOARD_CHECKED = 30
 MIN_LEADERBOARD_ACCURACY = 0.56
+MIN_LEADERBOARD_LONG_CHECKED = 150
+MIN_LEADERBOARD_LONG_ACCURACY = 0.56
+MIN_ACTIONABLE_RANGE_CHECKED = 100
+MIN_ACTIONABLE_RANGE_ACCURACY = 0.56
+DEFENSIVE_LOW_TARGETS = [2.0, 3.0]
+DEFENSIVE_LOW_MIN_PROBABILITY = {
+    2.0: 0.55,
+    3.0: 0.64,
+}
+DEFENSIVE_LOW_MIN_CHECKED = 100
+DEFENSIVE_LOW_MIN_ACCURACY = 0.60
 BACKTEST_CACHE = {
     "key": None,
     "generated_at": 0,
@@ -75,6 +104,33 @@ ML_PREDICTION_CACHE = {
     "signature": None,
     "payload": None,
 }
+EDGE_AUDIT_SETTINGS = {
+    "enabled": True,
+    "every_rounds": 250,
+    "check_seconds": 60,
+    "min_sample": 80,
+    "top": 20,
+    "walk_forward_folds": 6,
+}
+EDGE_AUDIT_STATE = {
+    "thread": None,
+    "status": "idle",
+    "last_checked_at": None,
+    "last_started_at": None,
+    "last_finished_at": None,
+    "last_success_at": None,
+    "last_error": None,
+    "last_returncode": None,
+    "last_output_tail": None,
+    "last_audited_rounds": None,
+}
+SEQUENCE_WATCH_BUCKETS = [
+    ("tiny", "<1.20x"),
+    ("small", "1.20x-1.99x"),
+    ("medium", "2.00x-5.99x"),
+    ("high", "6.00x-19.99x"),
+    ("very_high", "20.00x+"),
+]
 ML_RETRAIN_STATE = {
     "thread": None,
 }
@@ -83,6 +139,7 @@ ML_RETRAIN_SETTINGS = {
     "min_new_rounds": 500,
     "check_seconds": 30,
     "minimum_training_rounds": 3000,
+    "include_context": False,
     "promotion_min_skill_improvement": 0.005,
 }
 DISPLAY_MONEY_REFRESH_SECONDS = 2
@@ -167,6 +224,29 @@ def ingest_status(rounds):
     }
 
 
+def data_quality_snapshot(rounds):
+    try:
+        from data_quality_audit import audit_rows
+
+        return audit_rows(
+            rounds
+        )
+    except Exception as exc:
+        return {
+            "available": False,
+            "status": "bad",
+            "headline": "Data audit unavailable",
+            "score": 0,
+            "issues": [
+                {
+                    "severity": "bad",
+                    "label": "Audit error",
+                    "detail": f"{type(exc).__name__}: {exc}",
+                }
+            ],
+        }
+
+
 def compact_round_event(round_data, round_number, total_rounds, threshold=None):
     return {
         "timestamp": round_data.get("timestamp", ""),
@@ -243,6 +323,1046 @@ def big_round_watch(rounds):
     }
 
 
+def bucket_rate(values, target):
+    if not values:
+        return None
+
+    return len(
+        [
+            value
+            for value in values
+            if value >= target
+        ]
+    ) / len(values)
+
+
+def timing_bucket_score(rates, baselines):
+    score = 0
+    weights = {
+        2.0: 0.35,
+        5.0: 0.35,
+        10.0: 0.30,
+    }
+
+    for target, weight in weights.items():
+        rate = rates.get(
+            f"{target:.2f}"
+        )
+        baseline = baselines.get(
+            f"{target:.2f}"
+        )
+
+        if rate is None or baseline is None:
+            continue
+
+        score += (
+            rate - baseline
+        ) * weight
+
+    return score
+
+
+def compact_timing_bucket(label, key, values, baselines, bucket_type):
+    sorted_values = sorted(
+        values
+    )
+    rates = {
+        f"{target:.2f}": bucket_rate(
+            values,
+            target
+        )
+        for target in TIMING_TARGETS
+    }
+
+    score = timing_bucket_score(
+        rates,
+        baselines,
+    )
+
+    return {
+        "type": bucket_type,
+        "key": key,
+        "label": label,
+        "rounds": len(values),
+        "average": round_float(
+            sum(values) / len(values)
+        ),
+        "median": round_float(
+            sorted_values[len(sorted_values) // 2]
+        ),
+        "maximum": round_float(
+            max(values)
+        ),
+        "rates": rates,
+        "score": round_float(
+            score
+        ),
+        "edge_2x": round_float(
+            rates["2.00"] - baselines["2.00"]
+        ),
+        "edge_5x": round_float(
+            rates["5.00"] - baselines["5.00"]
+        ),
+        "edge_10x": round_float(
+            rates["10.00"] - baselines["10.00"]
+        ),
+    }
+
+
+def compact_window_stats(values):
+    if not values:
+        return {
+            "rounds": 0,
+            "average": None,
+            "median": None,
+            "maximum": None,
+            "rates": {},
+        }
+
+    sorted_values = sorted(
+        values
+    )
+
+    return {
+        "rounds": len(values),
+        "average": round_float(
+            sum(values) / len(values)
+        ),
+        "median": round_float(
+            sorted_values[len(sorted_values) // 2]
+        ),
+        "maximum": round_float(
+            max(values)
+        ),
+        "rates": {
+            f"{target:.2f}": bucket_rate(
+                values,
+                target,
+            )
+            for target in [
+                2.0,
+                5.0,
+                10.0,
+                20.0,
+                50.0,
+                100.0,
+            ]
+        },
+    }
+
+
+def window_values(parsed, start, end):
+    return [
+        multiplier
+        for timestamp, multiplier in parsed
+        if start <= timestamp < end
+    ]
+
+
+def same_time_last_week_comparison(parsed):
+    if not parsed:
+        return {
+            "available": False,
+            "message": "Same-time comparison needs saved rounds.",
+            "windows": [],
+        }
+
+    anchor = parsed[-1][0]
+    previous_anchor = anchor - timedelta(
+        days=7
+    )
+    earliest = parsed[0][0]
+    windows = []
+
+    for label, hours in (
+        ("1h", 1),
+        ("6h", 6),
+        ("24h", 24),
+    ):
+        current_start = anchor - timedelta(
+            hours=hours
+        )
+        previous_start = previous_anchor - timedelta(
+            hours=hours
+        )
+        current_values = window_values(
+            parsed,
+            current_start,
+            anchor,
+        )
+        previous_values = window_values(
+            parsed,
+            previous_start,
+            previous_anchor,
+        )
+        current_stats = compact_window_stats(
+            current_values
+        )
+        previous_stats = compact_window_stats(
+            previous_values
+        )
+        deltas = {}
+
+        for target in ("2.00", "5.00", "10.00", "20.00", "50.00", "100.00"):
+            current_rate = current_stats["rates"].get(
+                target
+            )
+            previous_rate = previous_stats["rates"].get(
+                target
+            )
+            deltas[target] = (
+                round_float(
+                    current_rate - previous_rate
+                )
+                if current_rate is not None and previous_rate is not None
+                else None
+            )
+
+        windows.append(
+            {
+                "label": label,
+                "hours": hours,
+                "current": current_stats,
+                "last_week": previous_stats,
+                "deltas": deltas,
+            }
+        )
+
+    has_history = previous_anchor >= earliest
+    return {
+        "available": has_history and any(
+            window["last_week"]["rounds"] > 0
+            for window in windows
+        ),
+        "anchor_timestamp": anchor.strftime(
+            "%Y-%m-%d %H:%M:%S"
+        ),
+        "last_week_timestamp": previous_anchor.strftime(
+            "%Y-%m-%d %H:%M:%S"
+        ),
+        "message": (
+            "Compared with the same time last week."
+            if has_history
+            else "Need at least 7 days of matching history."
+        ),
+        "windows": windows,
+        "note": "Same-time history is only a comparison, not a guarantee.",
+    }
+
+
+def timing_insights(rounds):
+    parsed = []
+
+    for round_data in rounds:
+        timestamp = parse_round_time(
+            round_data.get(
+                "timestamp",
+                ""
+            )
+        )
+        multiplier = round_data.get(
+            "multiplier"
+        )
+
+        if timestamp is None or multiplier is None:
+            continue
+
+        parsed.append(
+            (
+                timestamp,
+                float(multiplier),
+            )
+        )
+
+    values = [
+        multiplier
+        for _, multiplier in parsed
+    ]
+
+    if len(values) < TIMING_MIN_ROUNDS:
+        return {
+            "available": False,
+            "rounds": len(values),
+            "minimum_rounds": TIMING_MIN_ROUNDS,
+            "message": "Timing check needs more saved rounds.",
+            "top_windows": [],
+            "top_weekdays": [],
+            "top_hours": [],
+        }
+
+    baselines = {
+        f"{target:.2f}": bucket_rate(
+            values,
+            target
+        )
+        for target in TIMING_TARGETS
+    }
+    hour_buckets = {}
+    weekday_buckets = {}
+    window_buckets = {}
+
+    for timestamp, multiplier in parsed:
+        weekday = timestamp.weekday()
+        hour = timestamp.hour
+
+        hour_buckets.setdefault(
+            hour,
+            []
+        ).append(
+            multiplier
+        )
+        weekday_buckets.setdefault(
+            weekday,
+            []
+        ).append(
+            multiplier
+        )
+        window_buckets.setdefault(
+            (
+                weekday,
+                hour,
+            ),
+            []
+        ).append(
+            multiplier
+        )
+
+    def ranked(items, labeler, bucket_type):
+        buckets = []
+
+        for key, bucket_values in items.items():
+            if len(bucket_values) < TIMING_MIN_BUCKET_ROUNDS:
+                continue
+
+            buckets.append(
+                compact_timing_bucket(
+                    labeler(
+                        key
+                    ),
+                    key,
+                    bucket_values,
+                    baselines,
+                    bucket_type,
+                )
+            )
+
+        buckets.sort(
+            key=lambda item: (
+                item["score"],
+                item["rounds"],
+            ),
+            reverse=True,
+        )
+
+        return buckets[:TIMING_TOP_LIMIT]
+
+    top_windows = ranked(
+        window_buckets,
+        lambda key: f"{WEEKDAY_LABELS[key[0]]} {key[1]:02d}:00",
+        "weekday_hour",
+    )
+    top_weekdays = ranked(
+        weekday_buckets,
+        lambda key: WEEKDAY_LABELS[key],
+        "weekday",
+    )
+    top_hours = ranked(
+        hour_buckets,
+        lambda key: f"{key:02d}:00",
+        "hour",
+    )
+    current_time = datetime.now()
+    current_key = (
+        current_time.weekday(),
+        current_time.hour,
+    )
+    current_values = window_buckets.get(
+        current_key,
+        []
+    )
+    current_window = None
+
+    if len(current_values) >= TIMING_MIN_BUCKET_ROUNDS:
+        current_window = compact_timing_bucket(
+            f"{WEEKDAY_LABELS[current_key[0]]} {current_key[1]:02d}:00",
+            current_key,
+            current_values,
+            baselines,
+            "current_weekday_hour",
+        )
+
+    best = top_windows[0] if top_windows else None
+    message = (
+        f"Historically strongest window: {best['label']}"
+        if best and best.get("score", 0) > 0
+        else "No clear timing edge above average."
+    )
+
+    return {
+        "available": True,
+        "rounds": len(values),
+        "minimum_bucket_rounds": TIMING_MIN_BUCKET_ROUNDS,
+        "baselines": baselines,
+        "message": message,
+        "current_window": current_window,
+        "top_windows": top_windows,
+        "top_weekdays": top_weekdays,
+        "top_hours": top_hours,
+        "same_time_last_week": same_time_last_week_comparison(
+            parsed
+        ),
+        "note": "Historical timing only; it is not a profit guarantee.",
+    }
+
+
+def safe_number(value, default=0):
+    try:
+        if value is None:
+            return default
+
+        return float(
+            value
+        )
+    except (TypeError, ValueError):
+        return default
+
+
+def holdout_has_edge(item):
+    status = str(
+        item.get(
+            "holdout_status",
+            item.get(
+                "validation_status",
+                "",
+            ),
+        )
+        or ""
+    ).upper()
+    model = str(
+        item.get(
+            "model",
+            "",
+        )
+        or ""
+    )
+
+    if model == "historical_frequency":
+        return False
+
+    if "NO PREDICTIVE EDGE" in status:
+        return False
+
+    return safe_number(
+        item.get(
+            "edge"
+        )
+    ) >= 0.03
+
+
+def best_ml_edge(ml_prediction):
+    predictions = (
+        ml_prediction or {}
+    ).get(
+        "predictions",
+        {}
+    )
+    candidates = []
+
+    for target, item in predictions.items():
+        edge = safe_number(
+            item.get(
+                "edge"
+            )
+        )
+
+        if not holdout_has_edge(
+            item
+        ):
+            continue
+
+        candidates.append(
+            {
+                "target": target,
+                "edge": edge,
+                "probability": item.get(
+                    "probability"
+                ),
+                "model": item.get(
+                    "model"
+                ),
+                "holdout_status": item.get(
+                    "holdout_status"
+                ),
+            }
+        )
+
+    return max(
+        candidates,
+        key=lambda item: item["edge"],
+        default=None,
+    )
+
+
+def best_direct_edge(predictions):
+    candidates = []
+
+    for prediction in predictions or []:
+        edge = safe_number(
+            prediction.get(
+                "edge"
+            )
+        )
+        target = safe_number(
+            prediction.get(
+                "target"
+            )
+        )
+
+        if (
+            not prediction.get(
+                "clear_signal"
+            )
+            or not prediction.get(
+                "predicted_high"
+            )
+            or target < 1.5
+            or edge < 0.03
+        ):
+            continue
+
+        candidates.append(
+            {
+                "target": target,
+                "edge": edge,
+                "probability": prediction.get(
+                    "probability"
+                ),
+                "confidence": prediction.get(
+                    "confidence",
+                    "low",
+                ),
+                "signal": prediction.get(
+                    "signal",
+                    "",
+                ),
+            }
+        )
+
+    return max(
+        candidates,
+        key=lambda item: (
+            item["edge"],
+            item["target"],
+        ),
+        default=None,
+    )
+
+
+def compact_signal_reason(label, detail, tone="neutral"):
+    return {
+        "label": label,
+        "detail": detail,
+        "tone": tone,
+    }
+
+
+def format_signal_multiplier(value):
+    return f"{safe_number(value):.2f}x"
+
+
+def format_signal_percent(value):
+    if value is None:
+        return "--"
+
+    return f"{round_float(safe_number(value) * 100)}%"
+
+
+def range_scoreboard_is_actionable(accuracy_summary):
+    active_model = (
+        accuracy_summary or {}
+    ).get(
+        "active_range_model"
+    )
+
+    if active_model:
+        if active_model.get(
+            "candidate_model"
+        ) == "baseline":
+            return False, None
+
+        return True, active_model
+
+    range_stats = (
+        accuracy_summary or {}
+    ).get(
+        "range",
+        {}
+    ) or {}
+    checked = int(
+        safe_number(
+            range_stats.get(
+                "checked"
+            )
+        )
+    )
+    accuracy = range_stats.get(
+        "accuracy"
+    )
+
+    if (
+        checked >= MIN_ACTIONABLE_RANGE_CHECKED
+        and accuracy is not None
+        and safe_number(
+            accuracy
+        ) >= MIN_ACTIONABLE_RANGE_ACCURACY
+    ):
+        return True, {
+            "candidate_model": "range_scoreboard",
+            "checked": checked,
+            "accuracy": accuracy,
+        }
+
+    return False, None
+
+
+def defensive_low_call(predictions, accuracy_summary):
+    target_stats = (
+        accuracy_summary or {}
+    ).get(
+        "targets",
+        {}
+    ) or {}
+    candidates = []
+
+    for prediction in predictions or []:
+        target = safe_number(
+            prediction.get(
+                "target"
+            )
+        )
+
+        if target not in DEFENSIVE_LOW_TARGETS:
+            continue
+
+        if prediction.get(
+            "predicted_high"
+        ):
+            continue
+
+        low_probability = 1 - safe_number(
+            prediction.get(
+                "probability"
+            )
+        )
+        minimum_probability = DEFENSIVE_LOW_MIN_PROBABILITY.get(
+            target,
+            0.65,
+        )
+
+        if low_probability < minimum_probability:
+            continue
+
+        stats = target_stats.get(
+            f"{target:.2f}",
+            {},
+        ) or {}
+        checked = int(
+            safe_number(
+                stats.get(
+                    "checked"
+                )
+            )
+        )
+        accuracy = stats.get(
+            "accuracy"
+        )
+
+        if (
+            checked < DEFENSIVE_LOW_MIN_CHECKED
+            or accuracy is None
+            or safe_number(
+                accuracy
+            ) < DEFENSIVE_LOW_MIN_ACCURACY
+        ):
+            continue
+
+        baseline_low = 1 - safe_number(
+            prediction.get(
+                "baseline_probability"
+            )
+        )
+        candidates.append(
+            {
+                "status": "defensive",
+                "label": "DEFENSIVE",
+                "target": target,
+                "main_call": f"Likely below {format_signal_multiplier(target)}",
+                "cashout": (
+                    "No high chase; if playing, protect before 2.00x."
+                    if target >= 3
+                    else "No high chase; cash out very early."
+                ),
+                "probability": low_probability,
+                "baseline_probability": baseline_low,
+                "accuracy": accuracy,
+                "checked": checked,
+                "detail": (
+                    f"Model says below {format_signal_multiplier(target)} is "
+                    f"{format_signal_percent(low_probability)}; history is "
+                    f"{format_signal_percent(baseline_low)}; recent low-rate is "
+                    f"{format_signal_percent(accuracy)} over {checked} rounds."
+                ),
+            }
+        )
+
+    return max(
+        candidates,
+        key=lambda item: (
+            item["target"],
+            item["probability"],
+        ),
+        default=None,
+    )
+
+
+def signal_quality(payload):
+    summary = payload.get(
+        "summary",
+        {}
+    )
+    next_round = payload.get(
+        "next_round",
+        {}
+    )
+    timing = payload.get(
+        "timing_insights",
+        {}
+    ) or {}
+    range_estimate = next_round.get(
+        "range_estimate",
+        {}
+    ) or {}
+    predictions = next_round.get(
+        "predictions",
+        []
+    )
+    accuracy_summary = payload.get(
+        "accuracy_summary",
+        {},
+    ) or {}
+    ml_edge = best_ml_edge(
+        payload.get(
+            "ml_prediction"
+        )
+    )
+    direct_edge = best_direct_edge(
+        predictions
+    )
+    current_window = timing.get(
+        "current_window"
+    ) or {}
+    current_timing_score = safe_number(
+        current_window.get(
+            "score"
+        )
+    )
+    current_timing_rounds = int(
+        safe_number(
+            current_window.get(
+                "rounds"
+            )
+        )
+    )
+    range_edge = safe_number(
+        range_estimate.get(
+            "edge"
+        )
+    )
+    range_max = range_estimate.get(
+        "maximum"
+    )
+    range_scoreboard_ok, range_scoreboard = range_scoreboard_is_actionable(
+        accuracy_summary
+    )
+    range_is_actionable = (
+        bool(
+            range_estimate.get(
+                "clear_signal"
+            )
+        )
+        and range_edge >= 0.03
+        and range_scoreboard_ok
+        and (
+            range_max is None
+            or safe_number(
+                range_max,
+                default=99,
+            ) <= 3
+        )
+    )
+    rounds = int(
+        safe_number(
+            summary.get(
+                "rounds"
+            )
+        )
+    )
+    points = 0
+    reasons = []
+
+    if rounds < 3000:
+        return {
+            "status": "wait",
+            "label": "WAIT",
+            "score": 0,
+            "headline": "Wait - collecting enough history",
+            "main_call": "No play signal",
+            "cashout": "No reliable cashout target",
+            "reasons": [
+                compact_signal_reason(
+                    "Data",
+                    f"{rounds} rounds saved, needs 3000+ for signal quality.",
+                    "wait",
+                )
+            ],
+        }
+
+    if ml_edge:
+        edge = safe_number(
+            ml_edge.get(
+                "edge"
+            )
+        )
+        points += min(
+            55,
+            35 + edge * 300,
+        )
+        reasons.append(
+            compact_signal_reason(
+                "ML edge",
+                (
+                    f"{ml_edge.get('target')}x target is "
+                    f"{round_float(edge * 100)} pp above baseline."
+                ),
+                "good",
+            )
+        )
+    else:
+        reasons.append(
+            compact_signal_reason(
+                "ML edge",
+                "No promoted model is beating history yet.",
+                "wait",
+            )
+        )
+
+    if direct_edge:
+        edge = safe_number(
+            direct_edge.get(
+                "edge"
+            )
+        )
+        points += min(
+            35,
+            20 + edge * 220,
+        )
+        reasons.append(
+            compact_signal_reason(
+                "Pattern edge",
+                (
+                    f"{direct_edge['target']:.2f}x+ is "
+                    f"{round_float(edge * 100)} pp above history."
+                ),
+                "good",
+            )
+        )
+    else:
+        reasons.append(
+            compact_signal_reason(
+                "Pattern edge",
+                "No clear next-round pattern edge.",
+                "wait",
+            )
+        )
+
+    if range_is_actionable:
+        points += min(
+            25,
+            12 + range_edge * 220,
+        )
+        reasons.append(
+            compact_signal_reason(
+                "Range",
+                (
+                    f"{range_estimate.get('short') or range_estimate.get('label')} "
+                    f"has a usable range edge and passed recent scoring."
+                ),
+                "good",
+            )
+        )
+    else:
+        range_reason = range_estimate.get(
+            "clear_reason",
+            "Range not strong enough.",
+        )
+
+        if (
+            range_estimate.get(
+                "clear_signal"
+            )
+            and not range_scoreboard_ok
+        ):
+            range_reason = "Range signal is blocked because its scoreboard is not good enough yet."
+
+        reasons.append(
+            compact_signal_reason(
+                "Range",
+                range_reason,
+                "neutral",
+            )
+        )
+
+    if current_window:
+        if current_timing_score >= 0.06:
+            points += 22
+            tone = "good"
+            detail = (
+                f"{current_window.get('label')} is historically strong "
+                f"over {current_timing_rounds} rounds."
+            )
+        elif current_timing_score >= 0.03:
+            points += 12
+            tone = "neutral"
+            detail = (
+                f"{current_window.get('label')} is slightly above average "
+                f"over {current_timing_rounds} rounds."
+            )
+        else:
+            tone = "wait"
+            detail = (
+                f"{current_window.get('label')} is not above average enough."
+            )
+
+        reasons.append(
+            compact_signal_reason(
+                "Timing",
+                detail,
+                tone,
+            )
+        )
+    else:
+        reasons.append(
+            compact_signal_reason(
+                "Timing",
+                "Current weekday/hour does not have enough history yet.",
+                "neutral",
+            )
+        )
+
+    points = int(
+        min(
+            100,
+            max(
+                0,
+                round(
+                    points
+                ),
+            ),
+        )
+    )
+    has_proven_edge = bool(
+        ml_edge
+        or direct_edge
+        or range_is_actionable
+    )
+    defensive_call = defensive_low_call(
+        predictions,
+        accuracy_summary,
+    )
+    selective_call = {
+        "status": "no_call",
+        "label": "NO CALL",
+        "headline": "No reliable call right now",
+        "main_call": "No play signal",
+        "cashout": "No reliable cashout target.",
+        "reason": "No model or range is beating baseline enough.",
+    }
+
+    if points >= 65 and has_proven_edge:
+        status = "active"
+        label = "ACTIVE"
+        headline = "Active signal - edge confirmed"
+        main_call = (
+            f"Target {direct_edge['target']:.2f}x+"
+            if direct_edge
+            else f"Target {ml_edge.get('target')}x+"
+            if ml_edge
+            else range_estimate.get(
+                "short",
+                "Use shown range",
+            )
+        )
+        cashout = "Use only the shown target/range; avoid chasing big multipliers."
+        selective_call = {
+            "status": "active",
+            "label": "ACTIVE",
+            "headline": headline,
+            "main_call": main_call,
+            "cashout": cashout,
+            "reason": "Validated edge signal.",
+            "score": points,
+        }
+    elif defensive_call:
+        points = max(
+            points,
+            42,
+        )
+        status = "watch"
+        label = "DEFENSIVE"
+        headline = "Defensive read - common outcome only"
+        main_call = defensive_call["main_call"]
+        cashout = defensive_call["cashout"]
+        selective_call = {
+            **defensive_call,
+            "headline": headline,
+            "reason": "This is a defensive common-outcome read, not a proven profit edge.",
+            "score": points,
+        }
+        reasons.append(
+            compact_signal_reason(
+                "Defensive read",
+                defensive_call["detail"],
+                "neutral",
+            )
+        )
+    elif points >= 30:
+        status = "watch"
+        label = "WATCH"
+        headline = "Watch only - weak edge"
+        main_call = "No strong play signal"
+        cashout = "If playing, keep target small and do not chase 10x+."
+    else:
+        status = "wait"
+        label = "WAIT"
+        headline = "Wait - no proven edge"
+        main_call = "No play signal"
+        cashout = "No reliable cashout target."
+
+    return {
+        "status": status,
+        "label": label,
+        "score": points,
+        "headline": headline,
+        "main_call": main_call,
+        "cashout": cashout,
+        "reasons": reasons[:5],
+        "current_window": current_window or None,
+        "has_proven_edge": has_proven_edge,
+        "selective_call": selective_call,
+        "range_scoreboard": range_scoreboard,
+    }
+
+
 def refresh_cached_ingest(payload):
     payload = copy.deepcopy(payload)
     recent_rounds = payload.get("recent_rounds", [])
@@ -282,7 +1402,43 @@ def refresh_cached_ingest(payload):
             payload["round_context"]["participants"] = None
 
     payload["round_context"] = latest_round_context()
+    payload["collector_status"] = collector_status_snapshot()
+    cached_recent_rounds = payload.get(
+        "recent_rounds",
+        [],
+    )
+    chronological_cached_recent_rounds = list(
+        reversed(
+            cached_recent_rounds
+        )
+    )
+    payload.setdefault(
+        "edge_audit",
+        edge_audit_snapshot(
+            chronological_cached_recent_rounds
+        ),
+    )
+    payload["sequence_watch"] = sequence_watch_snapshot(
+        chronological_cached_recent_rounds
+    )
+    payload.setdefault(
+        "data_quality",
+        data_quality_snapshot(
+            chronological_cached_recent_rounds
+        ),
+    )
+    try:
+        latest_rounds = load_rounds(CSV_PATH) if CSV_PATH.exists() else chronological_cached_recent_rounds
+    except Exception:
+        latest_rounds = chronological_cached_recent_rounds
+
+    payload["strategy_audit"] = strategy_audit_snapshot(
+        latest_rounds
+    )
     payload["ml_retrain"] = ml_retrain_status_snapshot()
+    payload["signal_quality"] = signal_quality(
+        payload
+    )
 
     with BACKTEST_LOCK:
         if (
@@ -332,6 +1488,863 @@ def load_json_file(path):
             return json.load(f)
     except (OSError, json.JSONDecodeError):
         return None
+
+
+def collector_status_snapshot():
+    state = load_json_file(
+        COLLECTOR_STATE_PATH
+    ) or {}
+    status = state.get(
+        "game_status",
+        {}
+    )
+    realtime_channels = state.get(
+        "realtime_channels",
+        {}
+    )
+
+    if not isinstance(
+        realtime_channels,
+        dict
+    ):
+        realtime_channels = {}
+
+    channel_observed_at = realtime_channels.get(
+        "observed_at",
+        ""
+    )
+    parsed_channel_observed_at = parse_round_time(
+        channel_observed_at
+    )
+    channel_age_seconds = (
+        max(
+            0,
+            int(
+                (datetime.now() - parsed_channel_observed_at).total_seconds()
+            )
+        )
+        if parsed_channel_observed_at
+        else None
+    )
+    safe_realtime_channels = {
+        "available": bool(
+            realtime_channels.get(
+                "total"
+            )
+        ),
+        "labels": realtime_channels.get(
+            "labels",
+            []
+        ),
+        "total": realtime_channels.get(
+            "total",
+            0
+        ),
+        "observed_at": channel_observed_at,
+        "age_seconds": channel_age_seconds,
+        "secrets_saved": False,
+    }
+
+    if not isinstance(
+        status,
+        dict
+    ) or not status:
+        return {
+            "available": False,
+            "phase": None,
+            "label": "Waiting for game state",
+            "live_multiplier": None,
+            "age_seconds": None,
+            "realtime_channels": safe_realtime_channels,
+        }
+
+    observed_at = status.get(
+        "observed_at",
+        ""
+    )
+    parsed = parse_round_time(
+        observed_at
+    )
+    age_seconds = (
+        max(
+            0,
+            int(
+                (datetime.now() - parsed).total_seconds()
+            )
+        )
+        if parsed
+        else None
+    )
+    phase = status.get(
+        "phase"
+    )
+    labels = {
+        "preparing": "Preparing next round",
+        "starting": "Round starting",
+        "running": "Plane flying",
+        "finished": "Round crashed",
+    }
+
+    return {
+        "available": True,
+        "phase": phase,
+        "label": labels.get(
+            phase,
+            "Game state detected"
+        ),
+        "round_state": status.get(
+            "round_state"
+        ),
+        "is_preparing": status.get(
+            "is_preparing"
+        ),
+        "live_multiplier": round_float(
+            status.get(
+                "live_multiplier"
+            )
+        ),
+        "observed_at": observed_at,
+        "age_seconds": age_seconds,
+        "source": status.get(
+            "source"
+        ),
+        "game_source": status.get(
+            "game_source"
+        ),
+        "last_run_at": status.get(
+            "last_run_at"
+        ),
+        "last_finish_at": status.get(
+            "last_finish_at"
+        ),
+        "realtime_channels": safe_realtime_channels,
+    }
+
+
+def edge_audit_rounds(rounds):
+    try:
+        from edge_audit import Round as EdgeRound
+    except Exception:
+        return []
+
+    converted = []
+
+    for item in rounds:
+        timestamp = item.get(
+            "timestamp",
+            "",
+        )
+
+        try:
+            multiplier = float(
+                item.get(
+                    "multiplier"
+                )
+            )
+        except (TypeError, ValueError):
+            continue
+
+        converted.append(
+            EdgeRound(
+                timestamp=timestamp,
+                timestamp_dt=parse_round_time(
+                    timestamp
+                ),
+                multiplier=multiplier,
+                round_id=item.get(
+                    "round_id",
+                    "",
+                ),
+                source=item.get(
+                    "source",
+                    "",
+                ),
+            )
+        )
+
+    return converted
+
+
+def compact_edge_audit_item(item, is_active=False):
+    train = item.get(
+        "train",
+        {}
+    )
+    holdout = item.get(
+        "holdout",
+        {}
+    )
+    walk_forward = item.get(
+        "walk_forward",
+        {}
+    )
+
+    return {
+        "condition": item.get(
+            "condition",
+            "",
+        ),
+        "target": item.get(
+            "target",
+            "",
+        ),
+        "active": bool(
+            is_active
+        ),
+        "status": item.get(
+            "status",
+            "",
+        ),
+        "fdr_confirmed": bool(
+            item.get(
+                "fdr_confirmed"
+            )
+        ),
+        "walk_forward_stable": bool(
+            item.get(
+                "walk_forward_stable"
+            )
+        ),
+        "strong_edge": bool(
+            item.get(
+                "strong_edge"
+            )
+        ),
+        "watch_candidate": bool(
+            item.get(
+                "watch_candidate"
+            )
+        ),
+        "holdout_rate": holdout.get(
+            "rate"
+        ),
+        "holdout_baseline": holdout.get(
+            "baseline"
+        ),
+        "holdout_lift": holdout.get(
+            "lift"
+        ),
+        "holdout_lift_ci_low": holdout.get(
+            "lift_ci_low"
+        ),
+        "holdout_lift_ci_high": holdout.get(
+            "lift_ci_high"
+        ),
+        "holdout_lift_ci_excludes_zero": holdout.get(
+            "lift_ci_excludes_zero"
+        ),
+        "holdout_z": holdout.get(
+            "z"
+        ),
+        "holdout_q_value": holdout.get(
+            "q_value"
+        ),
+        "holdout_fdr_significant": holdout.get(
+            "fdr_significant"
+        ),
+        "holdout_checked": holdout.get(
+            "checked"
+        ),
+        "train_rate": train.get(
+            "rate"
+        ),
+        "train_checked": train.get(
+            "checked"
+        ),
+        "walk_forward_verdict": walk_forward.get(
+            "verdict"
+        ),
+        "walk_forward_valid_folds": walk_forward.get(
+            "valid_folds"
+        ),
+        "walk_forward_positive_folds": walk_forward.get(
+            "positive_folds"
+        ),
+        "walk_forward_significant_positive_folds": walk_forward.get(
+            "significant_positive_folds"
+        ),
+        "walk_forward_positive_fold_share": walk_forward.get(
+            "positive_fold_share"
+        ),
+        "walk_forward_average_lift": walk_forward.get(
+            "average_lift"
+        ),
+    }
+
+
+def edge_audit_snapshot(rounds):
+    report = load_json_file(
+        EDGE_AUDIT_PATH
+    )
+
+    if not isinstance(
+        report,
+        dict
+    ) or not report:
+        return {
+            "available": False,
+            "path": str(
+                EDGE_AUDIT_PATH
+            ),
+            "message": "Run edge_audit.py to create AI watch candidates.",
+            "refresh": edge_audit_status_snapshot(),
+            "active": [],
+            "watch": [],
+        }
+
+    active = []
+    edge_rounds = edge_audit_rounds(
+        rounds
+    )
+
+    if edge_rounds:
+        try:
+            from edge_audit import condition_matches
+        except Exception:
+            condition_matches = None
+
+        if condition_matches:
+            next_index = len(
+                edge_rounds
+            )
+
+            for item in report.get(
+                "validated_patterns",
+                []
+            ):
+                spec = item.get(
+                    "spec"
+                )
+
+                if not isinstance(
+                    spec,
+                    dict
+                ):
+                    continue
+
+                try:
+                    is_active = condition_matches(
+                        edge_rounds,
+                        next_index,
+                        spec,
+                    )
+                except Exception:
+                    is_active = False
+
+                if is_active:
+                    active.append(
+                        compact_edge_audit_item(
+                            item,
+                            True,
+                        )
+                    )
+
+    watch = [
+        compact_edge_audit_item(
+            item,
+            False,
+        )
+        for item in report.get(
+            "validated_patterns",
+            []
+        )[:8]
+    ]
+
+    return {
+        "available": True,
+        "path": str(
+            EDGE_AUDIT_PATH
+        ),
+        "generated_at": report.get(
+            "generated_at"
+        ),
+        "rounds": report.get(
+            "rounds"
+        ),
+        "strong_edge_count": report.get(
+            "strong_edge_count",
+            0,
+        ),
+        "watch_candidate_count": report.get(
+            "watch_candidate_count",
+            0,
+        ),
+        "fdr_confirmed_count": report.get(
+            "fdr_confirmed_count",
+            0,
+        ),
+        "walk_forward_stable_count": report.get(
+            "walk_forward_stable_count",
+            0,
+        ),
+        "walk_forward_folds": report.get(
+            "walk_forward_folds",
+            0,
+        ),
+        "patterns_tested": report.get(
+            "patterns_tested",
+            0,
+        ),
+        "validated_test_count": report.get(
+            "validated_test_count",
+            0,
+        ),
+        "fdr_alpha": report.get(
+            "fdr_alpha",
+        ),
+        "conclusion": report.get(
+            "conclusion",
+            "",
+        ),
+        "active": active[:5],
+        "watch": watch,
+        "big_multiplier_gaps": report.get(
+            "big_multiplier_gaps",
+            [],
+        ),
+        "refresh": edge_audit_status_snapshot(),
+    }
+
+
+def strategy_audit_snapshot(rounds):
+    report = load_json_file(
+        STRATEGY_AUDIT_PATH
+    )
+
+    if not isinstance(
+        report,
+        dict,
+    ) or not report:
+        return {
+            "available": False,
+            "status": "missing",
+            "headline": "Strategy audit missing",
+            "message": "Run strategy_audit.py to test cashout strategies on holdout data.",
+            "path": str(
+                STRATEGY_AUDIT_PATH
+            ),
+        }
+
+    audited_rounds = int(
+        safe_number(
+            report.get(
+                "rounds"
+            )
+        )
+    )
+    current_rounds = len(
+        rounds or []
+    )
+    new_rounds = max(
+        0,
+        current_rounds - audited_rounds,
+    )
+    stale = new_rounds >= 500
+
+    return {
+        "available": bool(
+            report.get(
+                "available",
+                True,
+            )
+        ),
+        "status": (
+            "stale"
+            if stale
+            else report.get(
+                "status",
+                "unknown",
+            )
+        ),
+        "headline": report.get(
+            "headline",
+            "Strategy audit ready",
+        ),
+        "message": report.get(
+            "message",
+            "",
+        ),
+        "generated_at": report.get(
+            "generated_at"
+        ),
+        "rounds": audited_rounds,
+        "current_rounds": current_rounds,
+        "new_rounds": new_rounds,
+        "stale": stale,
+        "train_rounds": report.get(
+            "train_rounds"
+        ),
+        "holdout_rounds": report.get(
+            "holdout_rounds"
+        ),
+        "best_train_strategy": report.get(
+            "best_train_strategy"
+        ),
+        "best_forward_candidate": report.get(
+            "best_forward_candidate"
+        ),
+        "positive_both_count": report.get(
+            "positive_both_count",
+            0,
+        ),
+        "family_winners": (
+            report.get(
+                "family_winners",
+                []
+            )[:5]
+            if isinstance(
+                report.get(
+                    "family_winners",
+                    []
+                ),
+                list,
+            )
+            else []
+        ),
+        "note": report.get(
+            "note",
+            "",
+        ),
+        "path": str(
+            STRATEGY_AUDIT_PATH
+        ),
+    }
+
+
+def sequence_watch_bucket(value):
+    try:
+        multiplier = float(
+            value
+        )
+    except (TypeError, ValueError):
+        return None
+
+    if multiplier < 1.2:
+        return "tiny"
+    if multiplier < 2.0:
+        return "small"
+    if multiplier < 6.0:
+        return "medium"
+    if multiplier < 20.0:
+        return "high"
+    return "very_high"
+
+
+def sequence_watch_label(keys):
+    label_map = dict(
+        SEQUENCE_WATCH_BUCKETS
+    )
+
+    return " -> ".join(
+        label_map.get(
+            key,
+            key,
+        )
+        for key in keys
+    )
+
+
+def current_sequence_watch_keys(rounds):
+    sequences = []
+
+    for length in (
+        2,
+        3,
+        4,
+    ):
+        if len(
+            rounds
+        ) < length:
+            continue
+
+        values = []
+
+        for item in rounds[-length:]:
+            bucket = sequence_watch_bucket(
+                item.get(
+                    "multiplier"
+                )
+            )
+
+            if bucket is None:
+                values = []
+                break
+
+            values.append(
+                bucket
+            )
+
+        if not values:
+            continue
+
+        key = f"seq_{length}_{'_'.join(values)}"
+        sequences.append(
+            {
+                "length": length,
+                "key": key,
+                "label": sequence_watch_label(
+                    values
+                ),
+            }
+        )
+
+    return sequences
+
+
+def compact_sequence_watch_item(item, is_active=False):
+    train = item.get(
+        "train",
+        {}
+    )
+    holdout = item.get(
+        "holdout",
+        {}
+    )
+    walk_forward = item.get(
+        "walk_forward",
+        {}
+    )
+
+    return {
+        "pattern": item.get(
+            "pattern",
+            "",
+        ),
+        "pattern_key": item.get(
+            "pattern_key",
+            "",
+        ),
+        "outcome": item.get(
+            "outcome",
+            "",
+        ),
+        "outcome_key": item.get(
+            "outcome_key",
+            "",
+        ),
+        "status": item.get(
+            "status",
+            "",
+        ),
+        "active": bool(
+            is_active
+        ),
+        "holdout_rate": holdout.get(
+            "rate"
+        ),
+        "holdout_baseline": holdout.get(
+            "baseline"
+        ),
+        "holdout_lift": holdout.get(
+            "lift"
+        ),
+        "holdout_lift_ci_low": holdout.get(
+            "lift_ci_low"
+        ),
+        "holdout_lift_ci_high": holdout.get(
+            "lift_ci_high"
+        ),
+        "holdout_lift_ci_excludes_zero": holdout.get(
+            "lift_ci_excludes_zero"
+        ),
+        "holdout_z": holdout.get(
+            "z"
+        ),
+        "holdout_q_value": holdout.get(
+            "q_value"
+        ),
+        "holdout_fdr_significant": holdout.get(
+            "fdr_significant"
+        ),
+        "holdout_checked": holdout.get(
+            "checked"
+        ),
+        "train_rate": train.get(
+            "rate"
+        ),
+        "train_checked": train.get(
+            "checked"
+        ),
+        "walk_forward_valid_folds": walk_forward.get(
+            "valid_folds"
+        ),
+        "walk_forward_positive_folds": walk_forward.get(
+            "positive_folds"
+        ),
+        "walk_forward_significant_positive_folds": walk_forward.get(
+            "significant_positive_folds"
+        ),
+        "walk_forward_average_lift": walk_forward.get(
+            "average_lift"
+        ),
+    }
+
+
+def sequence_watch_snapshot(rounds):
+    report = load_json_file(
+        PATTERN_DISCOVERY_PATH
+    )
+    current_sequences = current_sequence_watch_keys(
+        rounds
+    )
+
+    if not isinstance(
+        report,
+        dict
+    ) or not report:
+        return {
+            "available": False,
+            "path": str(
+                PATTERN_DISCOVERY_PATH
+            ),
+            "message": "Run pattern_discovery.py to create sequence watch data.",
+            "active": [],
+            "weak_active": [],
+            "confirmed": [],
+            "watch": [],
+            "current_sequences": current_sequences,
+        }
+
+    groups = report.get(
+        "groups",
+        {}
+    )
+    sequence_items = []
+
+    if isinstance(
+        groups,
+        dict
+    ):
+        sequence_items = [
+            item
+            for item in groups.get(
+                "bucket_sequence",
+                []
+            )
+            if isinstance(
+                item,
+                dict,
+            )
+        ]
+
+    if not sequence_items:
+        sequence_items = [
+            item
+            for item in report.get(
+                "top",
+                []
+            )
+            if isinstance(
+                item,
+                dict,
+            )
+            and item.get(
+                "group"
+            )
+            == "bucket_sequence"
+        ]
+
+    active_keys = {
+        item["key"]
+        for item in current_sequences
+    }
+    active = [
+        compact_sequence_watch_item(
+            item,
+            True,
+        )
+        for item in sequence_items
+        if item.get(
+            "pattern_key"
+        )
+        in active_keys
+        and item.get(
+            "status"
+        )
+        == "confirmed"
+        and item.get(
+            "holdout",
+            {}
+        ).get(
+            "fdr_significant"
+        )
+        and item.get(
+            "holdout",
+            {}
+        ).get(
+            "lift_ci_excludes_zero"
+        )
+    ]
+    weak_active = [
+        compact_sequence_watch_item(
+            item,
+            True,
+        )
+        for item in sequence_items
+        if item.get(
+            "pattern_key"
+        )
+        in active_keys
+        and item.get(
+            "status"
+        )
+        in {
+            "watch_strong",
+            "watch",
+        }
+    ]
+    confirmed = [
+        compact_sequence_watch_item(
+            item,
+            False,
+        )
+        for item in sequence_items
+        if item.get(
+            "status"
+        )
+        == "confirmed"
+    ]
+    watch = [
+        compact_sequence_watch_item(
+            item,
+            False,
+        )
+        for item in sequence_items
+        if item.get(
+            "status"
+        )
+        in {
+            "watch_strong",
+            "watch",
+        }
+    ]
+
+    return {
+        "available": True,
+        "path": str(
+            PATTERN_DISCOVERY_PATH
+        ),
+        "generated_at": report.get(
+            "generated_at"
+        ),
+        "rounds": report.get(
+            "rounds"
+        ),
+        "confirmed_count": len(
+            confirmed
+        ),
+        "watch_count": len(
+            watch
+        ),
+        "patterns_tested": report.get(
+            "patterns_tested",
+        ),
+        "current_sequences": current_sequences,
+        "active": active[:5],
+        "weak_active": weak_active[:5],
+        "confirmed": confirmed[:3],
+        "watch": watch[:3],
+    }
 
 
 def compact_ml_prediction_payload(payload, round_count):
@@ -403,7 +2416,12 @@ def current_ml_prediction(round_count):
             manifest_path=ML_MANIFEST_PATH,
             report_path=ML_REPORT_PATH,
             min_history=100,
-            include_context=False,
+            include_context=bool(
+                ML_RETRAIN_SETTINGS.get(
+                    "include_context",
+                    False,
+                )
+            ),
         )
         payload.setdefault(
             "generated_at",
@@ -459,6 +2477,22 @@ def load_ml_retrain_state():
 
 def infer_last_trained_rounds():
     state = load_ml_retrain_state()
+    report_path = state.get(
+        "report_path"
+    )
+
+    if report_path:
+        try:
+            from ml_auto_retrain import report_training_rounds
+
+            trained_rounds = report_training_rounds(
+                report_path
+            )
+        except Exception:
+            trained_rounds = 0
+
+        if trained_rounds > 0:
+            return trained_rounds
 
     for key in ("last_trained_rounds", "last_checked_rounds"):
         try:
@@ -498,22 +2532,34 @@ def output_tail(text, max_lines=35):
     return "\n".join(lines[-max_lines:])
 
 
+def ml_retrain_scheduler_config():
+    return {
+        "ml_retrain_every_rounds": ML_RETRAIN_SETTINGS["min_new_rounds"],
+        "ml_minimum_training_rounds": ML_RETRAIN_SETTINGS[
+            "minimum_training_rounds"
+        ],
+        "ml_include_context": ML_RETRAIN_SETTINGS.get(
+            "include_context",
+            False,
+        ),
+        "ml_promotion_min_skill_improvement": ML_RETRAIN_SETTINGS[
+            "promotion_min_skill_improvement"
+        ],
+    }
+
+
+def ml_retrain_scheduler_snapshot():
+    from ml_auto_retrain import scheduler_status
+
+    return scheduler_status(
+        ml_retrain_scheduler_config(),
+        CSV_PATH,
+    )
+
+
 def ml_retrain_status_snapshot():
     try:
-        from ml_auto_retrain import scheduler_status
-
-        status = scheduler_status(
-            {
-                "ml_retrain_every_rounds": ML_RETRAIN_SETTINGS["min_new_rounds"],
-                "ml_minimum_training_rounds": ML_RETRAIN_SETTINGS[
-                    "minimum_training_rounds"
-                ],
-                "ml_promotion_min_skill_improvement": ML_RETRAIN_SETTINGS[
-                    "promotion_min_skill_improvement"
-                ],
-            },
-            CSV_PATH,
-        )
+        status = ml_retrain_scheduler_snapshot()
         status["enabled"] = bool(ML_RETRAIN_SETTINGS.get("enabled", True))
         status["check_seconds"] = int(ML_RETRAIN_SETTINGS.get("check_seconds", 30))
 
@@ -602,6 +2648,8 @@ def run_ml_retrain(current_rounds):
         "dashboard",
         "--csv",
         str(CSV_PATH),
+        "--config",
+        str(CONFIG_PATH),
         "--retrain-every-rounds",
         str(ML_RETRAIN_SETTINGS["min_new_rounds"]),
         "--minimum-training-rounds",
@@ -623,14 +2671,47 @@ def run_ml_retrain(current_rounds):
             for item in (result.stdout, result.stderr)
             if item
         )
-        finished_rounds = csv_data_row_count()
+        try:
+            scheduler = ml_retrain_scheduler_snapshot()
+        except Exception:
+            scheduler = {}
+
+        finished_rounds = scheduler.get(
+            "current_rounds",
+            csv_data_row_count(),
+        )
+        finished_trained_rounds = scheduler.get(
+            "last_trained_rounds",
+            finished_rounds,
+        )
 
         if result.returncode == 0:
             update_ml_retrain_status(
-                status="complete",
+                status=scheduler.get("status", "complete"),
                 last_finished_at=now_string(),
                 last_success_at=now_string(),
-                last_trained_rounds=finished_rounds,
+                last_trained_rounds=finished_trained_rounds,
+                current_rounds=finished_rounds,
+                new_rounds_since_train=scheduler.get(
+                    "new_rounds_since_train",
+                    0,
+                ),
+                min_new_rounds=scheduler.get(
+                    "min_new_rounds",
+                    ML_RETRAIN_SETTINGS["min_new_rounds"],
+                ),
+                rounds_until_next_train=scheduler.get(
+                    "rounds_until_next_train",
+                    ML_RETRAIN_SETTINGS["min_new_rounds"],
+                ),
+                promoted_targets=scheduler.get(
+                    "promoted_targets",
+                    [],
+                ),
+                kept_targets=scheduler.get(
+                    "kept_targets",
+                    [],
+                ),
                 last_returncode=result.returncode,
                 last_output_tail=output_tail(combined_output),
                 last_error=None,
@@ -677,6 +2758,10 @@ def maybe_start_ml_retrain():
                     "promotion_min_skill_improvement",
                     0.005,
                 ),
+                "ml_include_context": settings.get(
+                    "include_context",
+                    False,
+                ),
             },
             CSV_PATH,
         )
@@ -687,6 +2772,26 @@ def maybe_start_ml_retrain():
         reason = "scheduler unavailable"
         current_rounds = csv_data_row_count()
         last_trained_rounds = infer_last_trained_rounds()
+        fallback_new_rounds = max(
+            0,
+            current_rounds - last_trained_rounds,
+        )
+        status = {
+            "new_rounds_since_train": fallback_new_rounds,
+            "min_new_rounds": settings.get(
+                "min_new_rounds",
+                500,
+            ),
+            "rounds_until_next_train": max(
+                0,
+                int(
+                    settings.get(
+                        "min_new_rounds",
+                        500,
+                    )
+                ) - fallback_new_rounds,
+            ),
+        }
 
     with ML_RETRAIN_LOCK:
         thread = ML_RETRAIN_STATE.get("thread")
@@ -696,6 +2801,18 @@ def maybe_start_ml_retrain():
                 status="training",
                 current_rounds=current_rounds,
                 last_trained_rounds=last_trained_rounds,
+                new_rounds_since_train=status.get(
+                    "new_rounds_since_train",
+                    0,
+                ),
+                min_new_rounds=status.get(
+                    "min_new_rounds",
+                    settings.get("min_new_rounds", 500),
+                ),
+                rounds_until_next_train=status.get(
+                    "rounds_until_next_train",
+                    0,
+                ),
             )
             return
 
@@ -704,6 +2821,18 @@ def maybe_start_ml_retrain():
                 status="waiting",
                 current_rounds=current_rounds,
                 last_trained_rounds=last_trained_rounds,
+                new_rounds_since_train=status.get(
+                    "new_rounds_since_train",
+                    0,
+                ),
+                min_new_rounds=status.get(
+                    "min_new_rounds",
+                    settings.get("min_new_rounds", 500),
+                ),
+                rounds_until_next_train=status.get(
+                    "rounds_until_next_train",
+                    0,
+                ),
                 message=reason,
             )
             return
@@ -722,6 +2851,7 @@ def start_ml_auto_retrainer(
     min_new_rounds=500,
     check_seconds=30,
     minimum_training_rounds=3000,
+    include_context=False,
     promotion_min_skill_improvement=0.005,
 ):
     ML_RETRAIN_SETTINGS.update(
@@ -730,6 +2860,7 @@ def start_ml_auto_retrainer(
             "min_new_rounds": max(1, int(min_new_rounds)),
             "check_seconds": max(5, int(check_seconds)),
             "minimum_training_rounds": max(100, int(minimum_training_rounds)),
+            "include_context": bool(include_context),
             "promotion_min_skill_improvement": max(
                 0.0,
                 float(promotion_min_skill_improvement),
@@ -749,6 +2880,341 @@ def start_ml_auto_retrainer(
 
             time.sleep(
                 ML_RETRAIN_SETTINGS["check_seconds"]
+            )
+
+    thread = threading.Thread(
+        target=worker,
+        daemon=True,
+    )
+    thread.start()
+    return thread
+
+
+def current_edge_audit_rounds():
+    report = load_json_file(
+        EDGE_AUDIT_PATH
+    )
+
+    if not isinstance(
+        report,
+        dict,
+    ):
+        return 0
+
+    try:
+        return max(
+            0,
+            int(
+                report.get(
+                    "rounds",
+                    0,
+                )
+            ),
+        )
+    except (TypeError, ValueError):
+        return 0
+
+
+def edge_audit_status_snapshot():
+    settings = dict(
+        EDGE_AUDIT_SETTINGS
+    )
+    audited_rounds = current_edge_audit_rounds()
+    current_rounds = csv_data_row_count()
+    new_rounds = max(
+        0,
+        current_rounds - audited_rounds,
+    )
+    thread = EDGE_AUDIT_STATE.get(
+        "thread"
+    )
+    is_running = bool(
+        thread
+        and thread.is_alive()
+    )
+
+    status = EDGE_AUDIT_STATE.get(
+        "status",
+        "idle",
+    )
+
+    if is_running:
+        status = "running"
+    elif not settings.get(
+        "enabled",
+        True,
+    ):
+        status = "disabled"
+    elif not EDGE_AUDIT_PATH.exists():
+        status = "due"
+    elif new_rounds < settings.get(
+        "every_rounds",
+        250,
+    ):
+        status = "waiting"
+
+    return {
+        "enabled": bool(
+            settings.get(
+                "enabled",
+                True,
+            )
+        ),
+        "status": status,
+        "current_rounds": current_rounds,
+        "last_audited_rounds": audited_rounds,
+        "new_rounds_since_audit": new_rounds,
+        "every_rounds": int(
+            settings.get(
+                "every_rounds",
+                250,
+            )
+        ),
+        "rounds_until_next_audit": max(
+            0,
+            int(
+                settings.get(
+                    "every_rounds",
+                    250,
+                )
+            ) - new_rounds,
+        ),
+        "check_seconds": int(
+            settings.get(
+                "check_seconds",
+                60,
+            )
+        ),
+        "last_checked_at": EDGE_AUDIT_STATE.get(
+            "last_checked_at"
+        ),
+        "last_started_at": EDGE_AUDIT_STATE.get(
+            "last_started_at"
+        ),
+        "last_finished_at": EDGE_AUDIT_STATE.get(
+            "last_finished_at"
+        ),
+        "last_success_at": EDGE_AUDIT_STATE.get(
+            "last_success_at"
+        ),
+        "last_error": EDGE_AUDIT_STATE.get(
+            "last_error"
+        ),
+        "last_returncode": EDGE_AUDIT_STATE.get(
+            "last_returncode"
+        ),
+        "last_output_tail": EDGE_AUDIT_STATE.get(
+            "last_output_tail"
+        ),
+    }
+
+
+def update_edge_audit_status(**updates):
+    EDGE_AUDIT_STATE.update(
+        updates
+    )
+    EDGE_AUDIT_STATE["last_checked_at"] = now_string()
+    return EDGE_AUDIT_STATE
+
+
+def run_edge_audit_refresh(current_rounds):
+    update_edge_audit_status(
+        status="running",
+        last_started_at=now_string(),
+        last_error=None,
+        last_returncode=None,
+        started_rounds=current_rounds,
+    )
+
+    command = [
+        sys.executable,
+        str(ROOT / "edge_audit.py"),
+        "--min-sample",
+        str(
+            EDGE_AUDIT_SETTINGS["min_sample"]
+        ),
+        "--top",
+        str(
+            EDGE_AUDIT_SETTINGS["top"]
+        ),
+        "--walk-forward-folds",
+        str(
+            EDGE_AUDIT_SETTINGS["walk_forward_folds"]
+        ),
+    ]
+
+    try:
+        result = subprocess.run(
+            command,
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+            timeout=60 * 10,
+        )
+        combined_output = "\n".join(
+            item
+            for item in (
+                result.stdout,
+                result.stderr,
+            )
+            if item
+        )
+        audited_rounds = current_edge_audit_rounds()
+
+        if result.returncode == 0:
+            update_edge_audit_status(
+                status="complete",
+                last_finished_at=now_string(),
+                last_success_at=now_string(),
+                last_returncode=result.returncode,
+                last_output_tail=output_tail(
+                    combined_output,
+                    20,
+                ),
+                last_error=None,
+                last_audited_rounds=audited_rounds,
+            )
+            DASHBOARD_CACHE.clear()
+            return
+
+        update_edge_audit_status(
+            status="failed",
+            last_finished_at=now_string(),
+            last_returncode=result.returncode,
+            last_output_tail=output_tail(
+                combined_output,
+                20,
+            ),
+            last_error="edge_audit.py failed",
+        )
+
+    except Exception as exc:
+        update_edge_audit_status(
+            status="failed",
+            last_finished_at=now_string(),
+            last_error=f"{type(exc).__name__}: {exc}",
+        )
+
+
+def maybe_start_edge_audit_refresh():
+    settings = EDGE_AUDIT_SETTINGS
+    current_rounds = csv_data_row_count()
+    audited_rounds = current_edge_audit_rounds()
+    new_rounds = max(
+        0,
+        current_rounds - audited_rounds,
+    )
+    audit_due = (
+        current_rounds > 0
+        and (
+            not EDGE_AUDIT_PATH.exists()
+            or new_rounds >= settings.get(
+                "every_rounds",
+                250,
+            )
+        )
+    )
+
+    with EDGE_AUDIT_LOCK:
+        thread = EDGE_AUDIT_STATE.get(
+            "thread"
+        )
+
+        if thread and thread.is_alive():
+            update_edge_audit_status(
+                status="running",
+                current_rounds=current_rounds,
+                last_audited_rounds=audited_rounds,
+            )
+            return
+
+        if not settings.get(
+            "enabled",
+            True,
+        ):
+            update_edge_audit_status(
+                status="disabled",
+                current_rounds=current_rounds,
+                last_audited_rounds=audited_rounds,
+            )
+            return
+
+        if not audit_due:
+            update_edge_audit_status(
+                status="waiting",
+                current_rounds=current_rounds,
+                last_audited_rounds=audited_rounds,
+                new_rounds_since_audit=new_rounds,
+            )
+            return
+
+        thread = threading.Thread(
+            target=run_edge_audit_refresh,
+            args=(current_rounds,),
+            daemon=True,
+        )
+        EDGE_AUDIT_STATE["thread"] = thread
+        thread.start()
+
+
+def start_edge_audit_refresher(
+    enabled=True,
+    every_rounds=250,
+    check_seconds=60,
+    min_sample=80,
+    top=20,
+    walk_forward_folds=6,
+):
+    EDGE_AUDIT_SETTINGS.update(
+        {
+            "enabled": bool(
+                enabled
+            ),
+            "every_rounds": max(
+                1,
+                int(
+                    every_rounds
+                ),
+            ),
+            "check_seconds": max(
+                10,
+                int(
+                    check_seconds
+                ),
+            ),
+            "min_sample": max(
+                10,
+                int(
+                    min_sample
+                ),
+            ),
+            "top": max(
+                1,
+                int(
+                    top
+                ),
+            ),
+            "walk_forward_folds": max(
+                2,
+                int(
+                    walk_forward_folds
+                ),
+            ),
+        }
+    )
+
+    def worker():
+        while True:
+            try:
+                maybe_start_edge_audit_refresh()
+            except Exception as exc:
+                update_edge_audit_status(
+                    status="failed",
+                    last_error=f"{type(exc).__name__}: {exc}",
+                )
+
+            time.sleep(
+                EDGE_AUDIT_SETTINGS["check_seconds"]
             )
 
     thread = threading.Thread(
@@ -1693,10 +4159,16 @@ def build_range_model_leaderboard():
     active = None
 
     for item in leaderboard:
+        if item.get("candidate_model") == "baseline":
+            continue
+
         if (
             item.get("checked", 0) >= MIN_LEADERBOARD_CHECKED
             and item.get("accuracy") is not None
             and item["accuracy"] >= MIN_LEADERBOARD_ACCURACY
+            and item.get("long_checked", 0) >= MIN_LEADERBOARD_LONG_CHECKED
+            and item.get("long_accuracy") is not None
+            and item["long_accuracy"] >= MIN_LEADERBOARD_LONG_ACCURACY
         ):
             active = item
             break
@@ -2602,8 +5074,14 @@ def compact_report(report, rounds):
         "warning": report["warning"],
         "data_selection": report.get("data_selection", {}),
         "ingest": ingest_status(rounds),
+        "data_quality": data_quality_snapshot(rounds),
+        "collector_status": collector_status_snapshot(),
         "round_context": latest_round_context(),
         "big_rounds": big_round_watch(rounds),
+        "timing_insights": timing_insights(rounds),
+        "edge_audit": edge_audit_snapshot(rounds),
+        "strategy_audit": strategy_audit_snapshot(rounds),
+        "sequence_watch": sequence_watch_snapshot(rounds),
         "summary": {
             "rounds": summary["rounds"],
             "latest_multiplier": round_float(summary["latest_multiplier"]),
@@ -2704,8 +5182,15 @@ def compact_live_payload(payload):
         "warning": payload.get("warning"),
         "data_selection": payload.get("data_selection", {}),
         "ingest": payload.get("ingest", {}),
+        "data_quality": payload.get("data_quality"),
+        "collector_status": payload.get("collector_status"),
         "round_context": payload.get("round_context"),
         "big_rounds": payload.get("big_rounds"),
+        "timing_insights": payload.get("timing_insights"),
+        "edge_audit": payload.get("edge_audit"),
+        "strategy_audit": payload.get("strategy_audit"),
+        "sequence_watch": payload.get("sequence_watch"),
+        "signal_quality": payload.get("signal_quality"),
         "summary": {
             "rounds": summary.get("rounds", 0),
             "latest_multiplier": summary.get("latest_multiplier"),
@@ -2759,6 +5244,12 @@ def build_dashboard_payload(query, include_backtests=True):
             file_signature(ML_MANIFEST_PATH),
             file_signature(ML_REPORT_PATH),
         )
+        current_pattern_signature = file_signature(
+            PATTERN_DISCOVERY_PATH
+        )
+        current_strategy_signature = file_signature(
+            STRATEGY_AUDIT_PATH
+        )
 
         cache_key = (
             lookback,
@@ -2767,6 +5258,8 @@ def build_dashboard_payload(query, include_backtests=True):
             current_csv_signature,
             current_config_signature,
             current_ml_signature,
+            current_pattern_signature,
+            current_strategy_signature,
         )
         cached = DASHBOARD_CACHE.get(cache_key)
 
@@ -2782,13 +5275,14 @@ def build_dashboard_payload(query, include_backtests=True):
         if not all_rounds:
             return {
                 "generated_at": None,
-            "warning": "No rounds have been collected yet.",
-            "ingest": {
-                "last_round_timestamp": None,
-                "last_round_age_seconds": None,
-                "is_stale": True,
-            },
-            "summary": {
+                "warning": "No rounds have been collected yet.",
+                "ingest": {
+                    "last_round_timestamp": None,
+                    "last_round_age_seconds": None,
+                    "is_stale": True,
+                },
+                "data_quality": data_quality_snapshot([]),
+                "summary": {
                     "rounds": 0,
                     "latest_multiplier": None,
                     "average": None,
@@ -2807,8 +5301,21 @@ def build_dashboard_payload(query, include_backtests=True):
                 "backtests": [],
                 "recent_rounds": [],
                 "chart_rounds": [],
+                "collector_status": collector_status_snapshot(),
                 "round_context": latest_round_context(),
                 "big_rounds": big_round_watch([]),
+                "timing_insights": timing_insights([]),
+                "sequence_watch": sequence_watch_snapshot([]),
+                "strategy_audit": strategy_audit_snapshot([]),
+                "signal_quality": signal_quality(
+                    {
+                        "summary": {
+                            "rounds": 0,
+                        },
+                        "next_round": {},
+                        "timing_insights": timing_insights([]),
+                    }
+                ),
                 "ml_prediction": current_ml_prediction(0),
                 "ml_retrain": ml_retrain_status_snapshot(),
                 "data_selection": data_selection,
@@ -2864,6 +5371,9 @@ def build_dashboard_payload(query, include_backtests=True):
         except Exception:
             pass
         payload["ml_retrain"] = ml_retrain_status_snapshot()
+        payload["signal_quality"] = signal_quality(
+            payload
+        )
         payload["_cached_at"] = time.monotonic()
 
         if len(DASHBOARD_CACHE) >= CACHE_MAX_ITEMS:
@@ -3103,6 +5613,12 @@ def main():
             )
         )
     )
+    ml_include_context = bool(
+        config.get(
+            "ml_include_context",
+            False,
+        )
+    )
     ml_retrain_check_seconds = (
         args.ml_retrain_check_seconds
         if args.ml_retrain_check_seconds is not None
@@ -3111,6 +5627,42 @@ def main():
                 "ml_retrain_check_seconds",
                 30,
             )
+        )
+    )
+    edge_audit_auto_refresh_enabled = bool(
+        config.get(
+            "edge_audit_auto_refresh",
+            True,
+        )
+    )
+    edge_audit_every_rounds = int(
+        config.get(
+            "edge_audit_every_rounds",
+            250,
+        )
+    )
+    edge_audit_check_seconds = int(
+        config.get(
+            "edge_audit_check_seconds",
+            60,
+        )
+    )
+    edge_audit_min_sample = int(
+        config.get(
+            "edge_audit_min_sample",
+            80,
+        )
+    )
+    edge_audit_top = int(
+        config.get(
+            "edge_audit_top",
+            20,
+        )
+    )
+    edge_audit_walk_forward_folds = int(
+        config.get(
+            "edge_audit_walk_forward_folds",
+            6,
         )
     )
 
@@ -3124,7 +5676,16 @@ def main():
         min_new_rounds=ml_retrain_min_new_rounds,
         check_seconds=ml_retrain_check_seconds,
         minimum_training_rounds=ml_minimum_training_rounds,
+        include_context=ml_include_context,
         promotion_min_skill_improvement=ml_promotion_min_skill_improvement,
+    )
+    start_edge_audit_refresher(
+        enabled=edge_audit_auto_refresh_enabled,
+        every_rounds=edge_audit_every_rounds,
+        check_seconds=edge_audit_check_seconds,
+        min_sample=edge_audit_min_sample,
+        top=edge_audit_top,
+        walk_forward_folds=edge_audit_walk_forward_folds,
     )
 
     print(f"Dashboard running at http://{args.host}:{args.port}")
@@ -3135,6 +5696,13 @@ def main():
         )
     else:
         print("ML auto-retrain disabled.")
+    if edge_audit_auto_refresh_enabled:
+        print(
+            "Edge audit auto-refresh enabled "
+            f"(every {edge_audit_every_rounds} new rounds)."
+        )
+    else:
+        print("Edge audit auto-refresh disabled.")
     print("Press Ctrl+C to stop.")
 
     try:

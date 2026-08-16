@@ -68,6 +68,7 @@ MODEL_VERSION = "ml-champion-v1"
 DEFAULT_CONFIG = {
     "ml_retrain_every_rounds": 500,
     "ml_minimum_training_rounds": 3000,
+    "ml_include_context": False,
     "ml_promotion_min_skill_improvement": 0.005,
     "ml_promotion_min_evaluated_rounds": 500,
     "ml_max_calibration_deterioration": 0.03,
@@ -80,6 +81,7 @@ LIVE_HISTORY_MODELS = {
     "recent_frequency_100",
     "majority",
 }
+STALE_LOCK_MAX_SECONDS = 6 * 60 * 60
 
 LIVE_PREDICTION_FIELDS = [
     "prediction_time",
@@ -106,6 +108,158 @@ def now_string() -> str:
 
 def version_string() -> str:
     return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def process_exists(pid: int) -> bool:
+    if pid <= 0:
+        return False
+
+    try:
+        os.kill(
+            pid,
+            0,
+        )
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+    return True
+
+
+def parse_lock_started_at(value: object) -> Optional[datetime]:
+    if not value:
+        return None
+
+    try:
+        return datetime.strptime(
+            str(value),
+            "%Y-%m-%d %H:%M:%S",
+        )
+    except ValueError:
+        return None
+
+
+def lock_info(path: Path = TRAINING_LOCK_PATH) -> dict:
+    if not path.exists():
+        return {
+            "exists": False,
+            "stale": False,
+        }
+
+    try:
+        payload = json.loads(
+            path.read_text(
+                encoding="utf-8",
+            )
+        )
+    except (OSError, json.JSONDecodeError):
+        payload = {}
+
+    try:
+        pid = int(
+            payload.get(
+                "pid",
+                0,
+            )
+            or 0
+        )
+    except (TypeError, ValueError):
+        pid = 0
+
+    started_at = parse_lock_started_at(
+        payload.get(
+            "started_at"
+        )
+    )
+    age_seconds = (
+        max(
+            0,
+            int((datetime.now() - started_at).total_seconds()),
+        )
+        if started_at
+        else None
+    )
+    alive = process_exists(
+        pid
+    )
+    too_old = (
+        age_seconds is not None
+        and age_seconds > STALE_LOCK_MAX_SECONDS
+    )
+    stale = not alive
+
+    return {
+        "exists": True,
+        "pid": pid,
+        "started_at": payload.get(
+            "started_at"
+        ),
+        "age_seconds": age_seconds,
+        "process_alive": alive,
+        "too_old": too_old,
+        "stale": stale,
+    }
+
+
+def clear_stale_training_lock(path: Path = TRAINING_LOCK_PATH) -> bool:
+    info = lock_info(
+        path
+    )
+
+    if not info.get(
+        "exists"
+    ) or not info.get(
+        "stale"
+    ):
+        return False
+
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return False
+
+    return True
+
+
+def report_training_rounds(path_value: object) -> int:
+    if not path_value:
+        return 0
+
+    try:
+        path = resolve_project_path(
+            str(path_value)
+        )
+    except (OSError, ValueError):
+        return 0
+
+    report = load_json(
+        path
+    )
+    dataset_statistics = report.get(
+        "dataset_statistics",
+        {},
+    )
+
+    for key in (
+        "training_rounds",
+        "feature_rows",
+    ):
+        try:
+            value = int(
+                dataset_statistics.get(
+                    key,
+                    0,
+                )
+                or 0
+            )
+        except (TypeError, ValueError):
+            value = 0
+
+        if value > 0:
+            return value
+
+    return 0
 
 
 def load_json(path: Path) -> dict:
@@ -144,6 +298,9 @@ def resolve_project_path(path_value: str) -> Path:
 @contextmanager
 def training_lock(path: Path = TRAINING_LOCK_PATH):
     DATA_DIR.mkdir(exist_ok=True)
+    clear_stale_training_lock(
+        path
+    )
     payload = {
         "pid": os.getpid(),
         "started_at": now_string(),
@@ -192,6 +349,7 @@ def normalized_config(config: Optional[dict] = None) -> dict:
     return {
         "ml_retrain_every_rounds": max(1, int(merged["ml_retrain_every_rounds"])),
         "ml_minimum_training_rounds": max(100, int(merged["ml_minimum_training_rounds"])),
+        "ml_include_context": bool(merged.get("ml_include_context", False)),
         "ml_promotion_min_skill_improvement": max(
             0.0,
             float(merged["ml_promotion_min_skill_improvement"]),
@@ -225,6 +383,13 @@ def csv_valid_round_count(csv_path: Path = DEFAULT_ROUNDS_PATH) -> int:
 
 def save_retrain_state(**updates) -> dict:
     state = load_json(RETRAIN_STATE_PATH)
+
+    if "last_output_tail" not in updates:
+        state.pop(
+            "last_output_tail",
+            None,
+        )
+
     state.update(updates)
     state["last_checked_at"] = now_string()
     atomic_write_json(RETRAIN_STATE_PATH, state)
@@ -615,7 +780,7 @@ def train_challengers(
             csv_path,
             targets=targets,
             min_history=100,
-            include_context=False,
+            include_context=config["ml_include_context"],
         )
         frame = dataset.frame
         if frame.empty:
@@ -637,7 +802,7 @@ def train_challengers(
             holdout_fraction=0.18,
             max_folds=None,
             min_history=100,
-            include_context=False,
+            include_context=config["ml_include_context"],
         )
         models = fixed_model_registry(calibration_methods=("uncalibrated",))
         records, validation_summary, selected = run_walk_forward_backtest(
@@ -1156,6 +1321,9 @@ def rollback_if_needed(config: Optional[dict] = None) -> dict:
 
 def scheduler_status(config: Optional[dict] = None, csv_path: Path = DEFAULT_ROUNDS_PATH) -> dict:
     config = normalized_config(config)
+    cleared_stale_lock = clear_stale_training_lock(
+        TRAINING_LOCK_PATH
+    )
     champion = ensure_champion()
     targets = champion_target_items(champion)
     valid_rounds = csv_valid_round_count(csv_path)
@@ -1164,21 +1332,42 @@ def scheduler_status(config: Optional[dict] = None, csv_path: Path = DEFAULT_ROU
         [int(item.get("trained_rounds", 0) or 0) for item in targets.values()] or [0]
     )
     state_trained_rounds = int(state.get("last_trained_rounds", 0) or 0)
-    last_trained_rounds = max(champion_trained_rounds, state_trained_rounds)
+    report_trained_rounds = report_training_rounds(
+        state.get(
+            "report_path"
+        )
+    )
+    last_trained_rounds = max(
+        champion_trained_rounds,
+        state_trained_rounds,
+        report_trained_rounds,
+    )
     new_rounds = max(0, valid_rounds - last_trained_rounds)
-    lock_exists = TRAINING_LOCK_PATH.exists()
+    current_lock_info = lock_info(
+        TRAINING_LOCK_PATH
+    )
+    lock_exists = bool(
+        current_lock_info.get(
+            "exists",
+            False,
+        )
+    )
     return {
         "enabled": True,
         "status": "training" if lock_exists else state.get("status", "waiting"),
         "current_rounds": valid_rounds,
         "last_trained_rounds": last_trained_rounds,
+        "report_trained_rounds": report_trained_rounds,
         "new_rounds_since_train": new_rounds,
         "min_new_rounds": config["ml_retrain_every_rounds"],
         "rounds_until_next_train": max(0, config["ml_retrain_every_rounds"] - new_rounds),
         "minimum_training_rounds": config["ml_minimum_training_rounds"],
+        "include_context": config["ml_include_context"],
         "promotion_min_skill_improvement": config["ml_promotion_min_skill_improvement"],
         "training_lock": str(TRAINING_LOCK_PATH),
         "lock_exists": lock_exists,
+        "lock_info": current_lock_info,
+        "cleared_stale_lock": cleared_stale_lock,
         "champion_targets": {
             label: {
                 "model_name": item.get("model_name"),

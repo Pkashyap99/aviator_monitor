@@ -22,17 +22,47 @@ const elements = {
   cashoutGuideText: document.getElementById("cashoutGuideText"),
   fastMain: document.querySelector(".fast-main"),
   previousPredictionStatus: document.getElementById("previousPredictionStatus"),
+  signalQualityPanel: document.getElementById("signalQualityPanel"),
+  signalQualityStatus: document.getElementById("signalQualityStatus"),
+  signalQualityMain: document.getElementById("signalQualityMain"),
+  signalQualityReasons: document.getElementById("signalQualityReasons"),
+  dataQualityPanel: document.getElementById("dataQualityPanel"),
+  dataQualityStatus: document.getElementById("dataQualityStatus"),
+  dataQualityMain: document.getElementById("dataQualityMain"),
+  dataQualityIssues: document.getElementById("dataQualityIssues"),
+  sequenceWatchPanel: document.getElementById("sequenceWatchPanel"),
+  sequenceWatchStatus: document.getElementById("sequenceWatchStatus"),
+  sequenceWatchMain: document.getElementById("sequenceWatchMain"),
+  sequenceWatchList: document.getElementById("sequenceWatchList"),
+  aiWatchPanel: document.getElementById("aiWatchPanel"),
+  aiWatchStatus: document.getElementById("aiWatchStatus"),
+  aiWatchMain: document.getElementById("aiWatchMain"),
+  aiWatchList: document.getElementById("aiWatchList"),
   accuracySummaryText: document.getElementById("accuracySummaryText"),
   selfLearningText: document.getElementById("selfLearningText"),
   sourceModeText: document.getElementById("sourceModeText"),
+  collectorStatusText: document.getElementById("collectorStatusText"),
   roundContextText: document.getElementById("roundContextText"),
   bigRoundPanel: document.getElementById("bigRoundPanel"),
   bigRoundStatus: document.getElementById("bigRoundStatus"),
   bigRoundList: document.getElementById("bigRoundList"),
+  timingPanel: document.getElementById("timingPanel"),
+  timingStatus: document.getElementById("timingStatus"),
+  timingSummary: document.getElementById("timingSummary"),
+  timingList: document.getElementById("timingList"),
   mlPredictionPanel: document.getElementById("mlPredictionPanel"),
   mlModelStatus: document.getElementById("mlModelStatus"),
   mlProbabilityList: document.getElementById("mlProbabilityList"),
   mlModelMeta: document.getElementById("mlModelMeta"),
+  modelHealthPanel: document.getElementById("modelHealthPanel"),
+  modelHealthStatus: document.getElementById("modelHealthStatus"),
+  modelHealthSummary: document.getElementById("modelHealthSummary"),
+  modelHealthMetrics: document.getElementById("modelHealthMetrics"),
+  modelHealthBigList: document.getElementById("modelHealthBigList"),
+  strategyAuditPanel: document.getElementById("strategyAuditPanel"),
+  strategyAuditStatus: document.getElementById("strategyAuditStatus"),
+  strategyAuditSummary: document.getElementById("strategyAuditSummary"),
+  strategyAuditList: document.getElementById("strategyAuditList"),
   latestMultiplier: document.getElementById("latestMultiplier"),
   roundCount: document.getElementById("roundCount"),
   medianValue: document.getElementById("medianValue"),
@@ -666,12 +696,17 @@ function bigMultiplierWatch(predictions) {
     .map((target) => findTargetPrediction(predictions, target))
     .filter(Boolean);
 
-  const clearBig = bigPredictions.find(
-    (prediction) => prediction.clear_signal && prediction.predicted_high
+  const strongBig = bigPredictions.find(
+    (prediction) => (
+      prediction.clear_signal
+      && prediction.predicted_high
+      && String(prediction.confidence || "").toLowerCase() === "high"
+      && Number(prediction.edge || 0) >= 0.03
+    )
   );
 
-  if (clearBig) {
-    return `High round chance: ${Number(clearBig.target).toFixed(0)}x+ possible`;
+  if (strongBig) {
+    return `Big round alert: ${Number(strongBig.target).toFixed(0)}x+ stronger than normal`;
   }
 
   const strongest = bigPredictions
@@ -679,10 +714,10 @@ function bigMultiplierWatch(predictions) {
     .sort((left, right) => Number(right.probability) - Number(left.probability))[0];
 
   if (!strongest) {
-    return "High round chance: waiting";
+    return "Big round alert: waiting";
   }
 
-  return `High round chance: normal (${formatPercent(strongest.probability)} for ${Number(strongest.target).toFixed(0)}x+)`;
+  return `Big round alert: no confirmed signal (${formatPercent(strongest.probability)} for ${Number(strongest.target).toFixed(0)}x+)`;
 }
 
 function mlPredictionEntries(mlPrediction) {
@@ -768,11 +803,11 @@ function buildMlFastDisplay(mlPrediction) {
   if (!hasEdge) {
     return {
       tone: "fast-range",
-      text: `${Number(main.target).toFixed(0)}x+ chance ${formatPercent(main.probability)}`,
-      meta: `${probabilityLine} | same as history`,
-      signal: "Model status: no proven edge",
-      cashout: "ML has no reliable cashout target",
-      bigWatch: mlBigWatchText(mlPrediction),
+      text: "No proven edge right now",
+      meta: `History rates only: ${probabilityLine}`,
+      signal: "Model status: same as history",
+      cashout: "No reliable cashout target",
+      bigWatch: "Big round alert: no confirmed signal",
     };
   }
 
@@ -784,6 +819,63 @@ function buildMlFastDisplay(mlPrediction) {
     cashout: `ML target: ${Number(bestEdge.target).toFixed(2)}x area`,
     bigWatch: mlBigWatchText(mlPrediction),
   };
+}
+
+function buildSelectiveFastDisplay(signalQuality) {
+  const call = signalQuality && signalQuality.selective_call
+    ? signalQuality.selective_call
+    : null;
+
+  if (!call || String(call.status || "").toLowerCase() === "no_call") {
+    return null;
+  }
+
+  const status = String(call.status || "").toLowerCase();
+  const probabilityText = call.probability !== null && call.probability !== undefined
+    ? `Chance ${formatPercent(call.probability)}`
+    : null;
+  const historyText = call.baseline_probability !== null && call.baseline_probability !== undefined
+    ? `history ${formatPercent(call.baseline_probability)}`
+    : null;
+  const accuracyText = call.accuracy !== null && call.accuracy !== undefined
+    ? status === "defensive"
+      ? `recent low-rate ${formatPercent(call.accuracy)}`
+      : `recent check ${formatPercent(call.accuracy)}`
+    : null;
+  const checkedText = call.checked
+    ? `${formatCount(call.checked)} scored`
+    : null;
+  const meta = [
+    call.headline || signalQuality.headline,
+    probabilityText,
+    historyText,
+    accuracyText,
+    checkedText,
+  ].filter(Boolean).join(" | ");
+
+  if (status === "active") {
+    return {
+      tone: "fast-high",
+      text: call.main_call || "Active call",
+      meta: meta || "Validated edge signal",
+      signal: "Signal: ACTIVE",
+      cashout: call.cashout || "Use shown target only",
+      bigWatch: "Big round alert: only if active signal says so",
+    };
+  }
+
+  if (status === "defensive") {
+    return {
+      tone: "fast-range",
+      text: call.main_call || "Defensive only",
+      meta: meta || "Common outcome read",
+      signal: "Signal: DEFENSIVE ONLY",
+      cashout: call.cashout || "No high chase",
+      bigWatch: "Big round alert: no confirmed signal",
+    };
+  }
+
+  return null;
 }
 
 function renderMlPrediction(mlPrediction, mlRetrain) {
@@ -888,6 +980,370 @@ function mlLiveMetricText(mlRetrain) {
   return `Live 2x score: ${formatPercent(metric.accuracy)} over ${formatCount(metric.predictions)} checks, skill ${skill}`;
 }
 
+function liveMetricForTarget(mlRetrain, target) {
+  const liveMetrics = mlRetrain && mlRetrain.live_metrics
+    ? mlRetrain.live_metrics
+    : {};
+  const key = Number(target).toFixed(2);
+  const targetMetrics = liveMetrics[key] || {};
+  return targetMetrics["500"]
+    || targetMetrics["250"]
+    || targetMetrics["100"]
+    || targetMetrics.all
+    || null;
+}
+
+function modelHealthStatusText(mlPrediction, mlRetrain) {
+  if (mlRetrain && mlRetrain.status === "training") {
+    return "Testing new model now";
+  }
+
+  const promotedTargets = mlRetrain && Array.isArray(mlRetrain.promoted_targets)
+    ? mlRetrain.promoted_targets
+    : [];
+
+  if (promotedTargets.length) {
+    return "Improved model active";
+  }
+
+  if (mlHasProvenEdge(mlPrediction)) {
+    return "Model edge detected";
+  }
+
+  return "No proven edge yet";
+}
+
+function readableModelName(name) {
+  if (!name) {
+    return "history baseline";
+  }
+
+  return String(name).replaceAll("_", " ");
+}
+
+function championModelText(mlRetrain) {
+  const targets = mlRetrain && mlRetrain.champion_targets
+    ? mlRetrain.champion_targets
+    : {};
+  const names = [...new Set(Object.values(targets)
+    .map((item) => readableModelName(item && item.model_name))
+    .filter(Boolean))];
+
+  if (!names.length) {
+    return "history baseline";
+  }
+
+  if (names.length === 1) {
+    return names[0];
+  }
+
+  return `${names.length} models`;
+}
+
+function simpleRejectReason(mlRetrain) {
+  const kept = mlRetrain && Array.isArray(mlRetrain.kept_targets)
+    ? mlRetrain.kept_targets
+    : [];
+
+  if (!kept.length) {
+    return "";
+  }
+
+  const meaningful = kept.find((item) => item.reason !== "candidate is already champion model type")
+    || kept[0];
+  const reason = String(meaningful.reason || "");
+
+  if (reason.includes("too small")) {
+    return "improvement was too small";
+  }
+
+  if (reason.includes("holdout")) {
+    return "latest unseen rounds were weak";
+  }
+
+  if (reason.includes("calibration")) {
+    return "probability quality was weak";
+  }
+
+  return "new model did not beat history enough";
+}
+
+function lastRetrainText(mlRetrain) {
+  if (!mlRetrain) {
+    return "Last retrain: checking";
+  }
+
+  if (mlRetrain.status === "training") {
+    return "Last retrain: running now";
+  }
+
+  if (mlRetrain.status === "failed") {
+    return "Last retrain: failed";
+  }
+
+  const promoted = Array.isArray(mlRetrain.promoted_targets)
+    ? mlRetrain.promoted_targets
+    : [];
+
+  if (promoted.length) {
+    return `Last retrain: improved ${promoted.join(", ")}`;
+  }
+
+  const kept = Array.isArray(mlRetrain.kept_targets)
+    ? mlRetrain.kept_targets
+    : [];
+
+  if (kept.length) {
+    const reason = simpleRejectReason(mlRetrain);
+    return reason
+      ? `Last retrain: no promotion, ${reason}`
+      : "Last retrain: no promotion";
+  }
+
+  if (mlRetrain.last_success_at) {
+    return `Last retrain: checked at ${mlRetrain.last_success_at}`;
+  }
+
+  return "Last retrain: waiting";
+}
+
+function nextRetrainText(mlRetrain) {
+  if (!mlRetrain) {
+    return "checking";
+  }
+
+  if (!mlRetrain.enabled) {
+    return "off";
+  }
+
+  if (mlRetrain.status === "training") {
+    return "now";
+  }
+
+  const remaining = Number(mlRetrain.rounds_until_next_train || 0);
+  return remaining > 0
+    ? `${formatCount(remaining)} rounds`
+    : "due soon";
+}
+
+function liveBaselineText(metric) {
+  if (!metric || !metric.predictions) {
+    return "collecting live checks";
+  }
+
+  const skill = Number(metric.brier_skill || 0);
+
+  if (skill > 0.005) {
+    return `beating baseline by ${formatPercentagePoints(skill)}`;
+  }
+
+  if (skill < -0.005) {
+    return `below baseline by ${formatPercentagePoints(skill)}`;
+  }
+
+  return "same as baseline";
+}
+
+function appendModelHealthMetric(parent, label, value, note, tone = "") {
+  const card = document.createElement("div");
+  card.className = ["model-health-metric", tone].filter(Boolean).join(" ");
+
+  const labelNode = document.createElement("span");
+  labelNode.textContent = label;
+  const valueNode = document.createElement("strong");
+  valueNode.textContent = value;
+  const noteNode = document.createElement("small");
+  noteNode.textContent = note;
+
+  card.append(labelNode, valueNode, noteNode);
+  parent.appendChild(card);
+}
+
+function renderModelHealthBigList(bigRounds) {
+  if (!elements.modelHealthBigList) {
+    return;
+  }
+
+  elements.modelHealthBigList.innerHTML = "";
+  const thresholds = Array.isArray(bigRounds && bigRounds.thresholds)
+    ? bigRounds.thresholds
+    : [];
+  const wanted = [10, 20, 50, 100]
+    .map((target) => thresholds.find((item) => Number(item.target) === target))
+    .filter(Boolean);
+
+  if (!wanted.length) {
+    elements.modelHealthBigList.textContent = "Big multiplier history: collecting";
+    return;
+  }
+
+  for (const item of wanted) {
+    const target = Number(item.target);
+    const row = document.createElement("div");
+    row.className = "model-health-big-row";
+
+    const label = document.createElement("span");
+    label.textContent = `${target.toFixed(0)}x+`;
+    const rate = document.createElement("strong");
+    rate.textContent = formatPercent(item.rate);
+    const note = document.createElement("small");
+    note.textContent = bigRoundGapText(item);
+
+    row.append(label, rate, note);
+    elements.modelHealthBigList.appendChild(row);
+  }
+}
+
+function renderModelHealth(data) {
+  if (
+    !elements.modelHealthPanel
+    || !elements.modelHealthStatus
+    || !elements.modelHealthSummary
+    || !elements.modelHealthMetrics
+  ) {
+    return;
+  }
+
+  const mlRetrain = data.ml_retrain || null;
+  const mlPrediction = data.ml_prediction || null;
+  const hasEdge = mlHasProvenEdge(mlPrediction);
+  const statusText = modelHealthStatusText(mlPrediction, mlRetrain);
+  const live2x = liveMetricForTarget(mlRetrain, 2);
+  const currentRounds = mlRetrain && mlRetrain.current_rounds
+    ? formatCount(mlRetrain.current_rounds)
+    : formatCount((data.summary || {}).rounds);
+  const newRounds = mlRetrain && mlRetrain.new_rounds_since_train !== undefined
+    ? formatCount(mlRetrain.new_rounds_since_train)
+    : "--";
+
+  elements.modelHealthPanel.classList.toggle("has-edge", hasEdge);
+  elements.modelHealthPanel.classList.toggle(
+    "is-training",
+    Boolean(mlRetrain && mlRetrain.status === "training"),
+  );
+  elements.modelHealthStatus.textContent = statusText;
+  elements.modelHealthSummary.textContent = lastRetrainText(mlRetrain);
+  elements.modelHealthMetrics.innerHTML = "";
+
+  appendModelHealthMetric(
+    elements.modelHealthMetrics,
+    "Current model",
+    championModelText(mlRetrain),
+    hasEdge ? "using promoted signal" : "following history baseline",
+    hasEdge ? "good" : "",
+  );
+  appendModelHealthMetric(
+    elements.modelHealthMetrics,
+    "Next test",
+    nextRetrainText(mlRetrain),
+    "automatic challenger check",
+  );
+  appendModelHealthMetric(
+    elements.modelHealthMetrics,
+    "Live 2x score",
+    live2x && live2x.predictions
+      ? `${formatPercent(live2x.accuracy)}`
+      : "--",
+    liveBaselineText(live2x),
+    live2x && Number(live2x.brier_skill || 0) > 0.005 ? "good" : "",
+  );
+  appendModelHealthMetric(
+    elements.modelHealthMetrics,
+    "Data used",
+    `${currentRounds} rounds`,
+    `${newRounds} new since last model test`,
+  );
+
+  renderModelHealthBigList(data.big_rounds || {});
+}
+
+function roiText(value) {
+  if (value === null || value === undefined || Number.isNaN(Number(value))) {
+    return "--";
+  }
+
+  const number = Number(value);
+  const sign = number > 0 ? "+" : "";
+  return `${sign}${formatPercent(number)}`;
+}
+
+function appendStrategyAuditRow(parent, label, item) {
+  if (!item) {
+    return;
+  }
+
+  const row = document.createElement("div");
+  row.className = "strategy-audit-row";
+
+  const title = document.createElement("span");
+  title.textContent = label;
+
+  const strategy = document.createElement("strong");
+  strategy.textContent = item.label || "strategy";
+
+  const detail = document.createElement("small");
+  const train = item.train || {};
+  const holdout = item.holdout || {};
+  detail.textContent = [
+    `old ${roiText(train.roi)} (${formatCount(train.bets || 0)} bets)`,
+    `later ${roiText(holdout.roi)} (${formatCount(holdout.bets || 0)} bets)`,
+  ].join(" | ");
+
+  row.append(title, strategy, detail);
+  parent.appendChild(row);
+}
+
+function renderStrategyAudit(strategyAudit) {
+  if (
+    !elements.strategyAuditPanel
+    || !elements.strategyAuditStatus
+    || !elements.strategyAuditSummary
+    || !elements.strategyAuditList
+  ) {
+    return;
+  }
+
+  const audit = strategyAudit || {};
+  const status = String(audit.status || "missing").toLowerCase();
+
+  elements.strategyAuditPanel.classList.remove("candidate", "no-edge", "stale", "missing");
+  elements.strategyAuditPanel.classList.add(status.replace("_", "-"));
+  elements.strategyAuditStatus.textContent = audit.headline || "Strategy audit missing";
+
+  if (!audit.available) {
+    elements.strategyAuditSummary.textContent = audit.message || "Run strategy_audit.py to test saved rounds.";
+    elements.strategyAuditList.textContent = "";
+    return;
+  }
+
+  const staleText = audit.stale
+    ? ` | stale by ${formatCount(audit.new_rounds || 0)} rounds`
+    : "";
+  elements.strategyAuditSummary.textContent = [
+    audit.message || "Strategy audit ready.",
+    `${formatCount(audit.train_rounds || 0)} old / ${formatCount(audit.holdout_rounds || 0)} later rounds${staleText}`,
+  ].join(" ");
+  elements.strategyAuditList.innerHTML = "";
+
+  appendStrategyAuditRow(
+    elements.strategyAuditList,
+    "Best old",
+    audit.best_train_strategy,
+  );
+  appendStrategyAuditRow(
+    elements.strategyAuditList,
+    "Forward watch",
+    audit.best_forward_candidate,
+  );
+
+  if (!audit.best_forward_candidate) {
+    const note = document.createElement("small");
+    note.className = "strategy-audit-note";
+    note.textContent = "No strategy stayed positive on later holdout.";
+    elements.strategyAuditList.appendChild(note);
+  }
+}
+
 function formatRoundsAgo(value) {
   if (value === null || value === undefined) {
     return "unknown";
@@ -990,6 +1446,487 @@ function renderBigRounds(bigRounds) {
       <small>${bigRoundGapText(item)}</small>
     `;
     elements.bigRoundList.appendChild(row);
+  }
+}
+
+function renderTimingInsights(timing) {
+  if (!elements.timingPanel || !elements.timingStatus || !elements.timingSummary || !elements.timingList) {
+    return;
+  }
+
+  elements.timingPanel.classList.remove("has-window");
+  elements.timingList.innerHTML = "";
+
+  if (!timing || !timing.available) {
+    elements.timingStatus.textContent = "Collecting timing";
+    elements.timingSummary.textContent = timing && timing.minimum_rounds
+      ? `${formatCount(timing.rounds)} rounds saved, needs ${formatCount(timing.minimum_rounds)}`
+      : "Historical timing only";
+    return;
+  }
+
+  const topWindows = Array.isArray(timing.top_windows) ? timing.top_windows : [];
+  const best = topWindows[0] || null;
+  const sameTime = timing.same_time_last_week || {};
+  const sameTimeWindows = sameTime && Array.isArray(sameTime.windows)
+    ? sameTime.windows
+    : [];
+
+  elements.timingStatus.textContent = best && Number(best.score) > 0
+    ? best.label
+    : "No clear time edge";
+  elements.timingSummary.textContent = sameTime.available
+    ? `Latest vs same time last week | ${formatCount(timing.rounds)} rounds checked`
+    : `${formatCount(timing.rounds)} rounds checked | ${formatCount(timing.minimum_bucket_rounds)}+ per window`;
+  elements.timingPanel.classList.toggle("has-window", Boolean(best && Number(best.score) > 0));
+
+  if (sameTime.available && sameTimeWindows.length) {
+    for (const item of sameTimeWindows.slice(0, 3)) {
+      const current = item.current || {};
+      const lastWeek = item.last_week || {};
+      const currentRates = current.rates || {};
+      const lastWeekRates = lastWeek.rates || {};
+      const deltas = item.deltas || {};
+      const row = document.createElement("div");
+      row.className = "timing-row timing-compare-row";
+
+      const label = document.createElement("span");
+      label.className = "timing-label";
+      label.textContent = `${item.label} vs last week`;
+
+      const ratesGrid = document.createElement("div");
+      ratesGrid.className = "timing-rate-grid";
+
+      for (const target of ["2.00", "5.00", "10.00"]) {
+        const cell = document.createElement("div");
+        cell.className = "timing-rate-cell";
+
+        const targetLabel = document.createElement("em");
+        targetLabel.textContent = `${Number(target).toFixed(0)}x+`;
+
+        const value = document.createElement("strong");
+        value.textContent = `${formatPercent(currentRates[target])} vs ${formatPercent(lastWeekRates[target])}`;
+
+        const delta = document.createElement("small");
+        delta.textContent = `change ${formatPercentagePoints(deltas[target])}`;
+
+        cell.appendChild(targetLabel);
+        cell.appendChild(value);
+        cell.appendChild(delta);
+        ratesGrid.appendChild(cell);
+      }
+
+      const detail = document.createElement("small");
+      detail.textContent = [
+        `now ${formatCount(current.rounds)} rounds`,
+        `last week ${formatCount(lastWeek.rounds)} rounds`,
+        sameTime.last_week_timestamp ? `reference ${sameTime.last_week_timestamp}` : null,
+      ].filter(Boolean).join(" | ");
+
+      row.appendChild(label);
+      row.appendChild(ratesGrid);
+      row.appendChild(detail);
+      elements.timingList.appendChild(row);
+    }
+  }
+
+  const rows = topWindows.slice(0, 4);
+
+  if (!rows.length) {
+    if (!elements.timingList.children.length) {
+      elements.timingList.textContent = "No weekday/hour bucket has enough data yet.";
+    }
+    return;
+  }
+
+  for (const item of rows) {
+    const rates = item.rates || {};
+    const row = document.createElement("div");
+    row.className = "timing-row";
+
+    const label = document.createElement("span");
+    label.className = "timing-label";
+    label.textContent = item.label || "--";
+
+    const ratesGrid = document.createElement("div");
+    ratesGrid.className = "timing-rate-grid";
+
+    for (const target of ["2.00", "5.00", "10.00"]) {
+      const cell = document.createElement("div");
+      cell.className = "timing-rate-cell";
+
+      const targetLabel = document.createElement("em");
+      targetLabel.textContent = `${Number(target).toFixed(0)}x+`;
+
+      const value = document.createElement("strong");
+      value.textContent = formatPercent(rates[target]);
+
+      cell.appendChild(targetLabel);
+      cell.appendChild(value);
+      ratesGrid.appendChild(cell);
+    }
+
+    const detail = document.createElement("small");
+    detail.textContent = [
+      `${formatCount(item.rounds)} rounds`,
+      `edge ${formatPercentagePoints(item.score)}`,
+    ].join(" | ");
+
+    row.appendChild(label);
+    row.appendChild(ratesGrid);
+    row.appendChild(detail);
+    elements.timingList.appendChild(row);
+  }
+
+  const note = document.createElement("small");
+  note.className = "timing-note";
+  note.textContent = timing.note || "Historical timing only; not a guarantee.";
+  elements.timingList.appendChild(note);
+}
+
+function renderSignalQuality(quality) {
+  if (
+    !elements.signalQualityPanel
+    || !elements.signalQualityStatus
+    || !elements.signalQualityMain
+    || !elements.signalQualityReasons
+  ) {
+    return;
+  }
+
+  const status = String((quality && quality.status) || "wait").toLowerCase();
+  const reasons = quality && Array.isArray(quality.reasons) ? quality.reasons : [];
+
+  elements.signalQualityPanel.classList.remove("wait", "watch", "active");
+  elements.signalQualityPanel.classList.add(status);
+  elements.signalQualityStatus.textContent = quality && quality.headline
+    ? quality.headline
+    : "Wait - no proven edge";
+
+  const scoreText = quality && Number.isFinite(Number(quality.score))
+    ? `Quality ${Math.round(Number(quality.score))}/100`
+    : "Quality --";
+  const mainCall = quality && quality.main_call ? quality.main_call : "No play signal";
+  const cashout = quality && quality.cashout ? quality.cashout : "No reliable cashout target.";
+  elements.signalQualityMain.textContent = `${scoreText} | ${mainCall} | ${cashout}`;
+  elements.signalQualityReasons.innerHTML = "";
+
+  for (const reason of reasons.slice(0, 4)) {
+    const row = document.createElement("div");
+    row.className = `signal-reason ${reason.tone || "neutral"}`;
+
+    const label = document.createElement("span");
+    label.textContent = reason.label || "Check";
+
+    const detail = document.createElement("small");
+    detail.textContent = reason.detail || "--";
+
+    row.appendChild(label);
+    row.appendChild(detail);
+    elements.signalQualityReasons.appendChild(row);
+  }
+}
+
+function renderDataQuality(quality) {
+  if (
+    !elements.dataQualityPanel
+    || !elements.dataQualityStatus
+    || !elements.dataQualityMain
+    || !elements.dataQualityIssues
+  ) {
+    return;
+  }
+
+  elements.dataQualityPanel.classList.remove("good", "watch", "bad", "empty");
+  elements.dataQualityIssues.innerHTML = "";
+
+  if (!quality || !quality.available) {
+    elements.dataQualityPanel.classList.add("empty");
+    elements.dataQualityStatus.textContent = "No data yet";
+    elements.dataQualityMain.textContent = "Waiting for saved rounds.";
+    return;
+  }
+
+  const status = String(quality.status || "watch").toLowerCase();
+  const normalizedStatus = ["good", "watch", "bad"].includes(status)
+    ? status
+    : "watch";
+  const score = Number(quality.score);
+  const scoreText = Number.isFinite(score) ? `${Math.round(score)}/100` : "--";
+  const intervals = quality.intervals || {};
+  const recentIntervals = quality.recent_intervals || {};
+  const usualGap = intervals.median_seconds !== null && intervals.median_seconds !== undefined
+    ? `${Number(intervals.median_seconds).toFixed(1)}s usual gap`
+    : "usual gap unknown";
+  const recentGaps = Number(recentIntervals.possible_capture_gap_count || 0);
+  const gapText = recentGaps > 0
+    ? `${recentGaps} recent gap${recentGaps === 1 ? "" : "s"}`
+    : "no recent gaps";
+  const ageText = quality.last_round_age_seconds !== null && quality.last_round_age_seconds !== undefined
+    ? `last ${formatAge(quality.last_round_age_seconds)} ago`
+    : "last time unknown";
+
+  elements.dataQualityPanel.classList.add(normalizedStatus);
+  elements.dataQualityStatus.textContent = `${quality.headline || "Data check"} (${scoreText})`;
+  elements.dataQualityMain.textContent = [
+    `${formatCount(quality.valid_rows)} usable rounds`,
+    usualGap,
+    gapText,
+    ageText,
+  ].join(" | ");
+
+  const issues = Array.isArray(quality.issues) ? quality.issues : [];
+
+  for (const issue of issues.slice(0, 3)) {
+    const row = document.createElement("div");
+    row.className = `data-quality-issue ${issue.severity || "info"}`;
+
+    const label = document.createElement("span");
+    label.textContent = issue.label || "Check";
+
+    const detail = document.createElement("small");
+    detail.textContent = issue.detail || "--";
+
+    row.appendChild(label);
+    row.appendChild(detail);
+    elements.dataQualityIssues.appendChild(row);
+  }
+}
+
+function plainSequencePattern(pattern) {
+  return String(pattern || "")
+    .replace(/^last\s+\d+\s+sequence:\s*/i, "")
+    .replace(/\s+->\s+/g, " then ");
+}
+
+function plainOutcomeText(outcome) {
+  const text = String(outcome || "");
+  const higher = text.match(/^next\s+>=\s+(.+)$/i);
+
+  if (higher) {
+    return `${higher[1]} or higher`;
+  }
+
+  const lower = text.match(/^next\s+<\s+(.+)$/i);
+
+  if (lower) {
+    return `below ${lower[1]}`;
+  }
+
+  return text || "--";
+}
+
+function sequenceWatchChanceText(item) {
+  if (!item) {
+    return "--";
+  }
+
+  const rate = formatPercent(item.holdout_rate);
+  const baseline = formatPercent(item.holdout_baseline);
+  const lift = Number(item.holdout_lift || 0);
+  const liftText = lift > 0
+    ? `${formatPercentagePoints(lift)} better`
+    : formatPercentagePoints(lift);
+  const checked = Number(item.holdout_checked);
+  const checkedText = Number.isFinite(checked)
+    ? `${formatCount(checked)} past matches`
+    : "past matches unavailable";
+
+  return `Past chance ${rate}. Normal chance ${baseline}. ${liftText}. Checked ${checkedText}.`;
+}
+
+function renderSequenceWatch(sequenceWatch) {
+  if (
+    !elements.sequenceWatchPanel
+    || !elements.sequenceWatchStatus
+    || !elements.sequenceWatchMain
+    || !elements.sequenceWatchList
+  ) {
+    return;
+  }
+
+  elements.sequenceWatchPanel.classList.remove("active", "watch", "empty");
+  elements.sequenceWatchList.innerHTML = "";
+
+  const currentSequences = sequenceWatch && Array.isArray(sequenceWatch.current_sequences)
+    ? sequenceWatch.current_sequences
+    : [];
+  const currentShort = currentSequences.length
+    ? currentSequences[0].label
+    : "waiting for last rounds";
+
+  if (!sequenceWatch || !sequenceWatch.available) {
+    elements.sequenceWatchPanel.classList.add("empty");
+    elements.sequenceWatchStatus.textContent = "Checking";
+    elements.sequenceWatchMain.textContent = sequenceWatch && sequenceWatch.message
+      ? sequenceWatch.message
+      : `Current: ${currentShort}`;
+    return;
+  }
+
+  const active = Array.isArray(sequenceWatch.active) ? sequenceWatch.active : [];
+  const weakActive = Array.isArray(sequenceWatch.weak_active) ? sequenceWatch.weak_active : [];
+  const confirmed = Array.isArray(sequenceWatch.confirmed) ? sequenceWatch.confirmed : [];
+  const watch = Array.isArray(sequenceWatch.watch) ? sequenceWatch.watch : [];
+  const bestActive = active[0] || null;
+  const bestWeakActive = weakActive[0] || null;
+  const bestConfirmed = confirmed[0] || null;
+
+  if (bestActive) {
+    elements.sequenceWatchPanel.classList.add("active");
+    elements.sequenceWatchStatus.textContent = "Strong big-round alert";
+    elements.sequenceWatchMain.textContent = `Recent rounds match a confirmed pattern. Target to watch: ${plainOutcomeText(bestActive.outcome)}. Still not guaranteed.`;
+  } else if (bestWeakActive) {
+    elements.sequenceWatchPanel.classList.add("watch");
+    elements.sequenceWatchStatus.textContent = "Weak match, no alert";
+    elements.sequenceWatchMain.textContent = `Recent rounds match a weak pattern for ${plainOutcomeText(bestWeakActive.outcome)}, but it is not reliable enough for a big-round alert.`;
+  } else if (bestConfirmed) {
+    elements.sequenceWatchPanel.classList.add("watch");
+    elements.sequenceWatchStatus.textContent = "No big signal now";
+    elements.sequenceWatchMain.textContent = `Current pattern: ${currentShort}. Waiting for: ${plainSequencePattern(bestConfirmed.pattern)}.`;
+  } else if (watch.length) {
+    elements.sequenceWatchPanel.classList.add("watch");
+    elements.sequenceWatchStatus.textContent = "Weak watch only";
+    elements.sequenceWatchMain.textContent = `Current pattern: ${currentShort}. No confirmed big-round signal yet.`;
+  } else {
+    elements.sequenceWatchPanel.classList.add("empty");
+    elements.sequenceWatchStatus.textContent = "No clear pattern";
+    elements.sequenceWatchMain.textContent = `Current pattern: ${currentShort}. No useful big-round signal found.`;
+  }
+
+  const rows = active.length
+    ? active
+    : weakActive.length
+      ? weakActive
+      : confirmed.concat(watch).slice(0, 3);
+
+  for (const item of rows) {
+    const row = document.createElement("div");
+    const isStrongActive = item.active && item.status === "confirmed";
+    row.className = `sequence-watch-row ${isStrongActive ? "active" : ""} ${item.status || ""}`;
+
+    const label = document.createElement("span");
+    label.textContent = isStrongActive
+      ? `Strong alert: ${plainOutcomeText(item.outcome)}`
+      : item.active
+        ? `Weak match only: ${plainOutcomeText(item.outcome)}`
+      : `Wait for: ${plainSequencePattern(item.pattern)} | Target: ${plainOutcomeText(item.outcome)}`;
+
+    const detail = document.createElement("small");
+    detail.textContent = sequenceWatchChanceText(item);
+
+    row.appendChild(label);
+    row.appendChild(detail);
+    elements.sequenceWatchList.appendChild(row);
+  }
+}
+
+function edgeAuditRateText(item) {
+  if (!item) {
+    return "--";
+  }
+
+  const rate = formatPercent(item.holdout_rate);
+  const baseline = formatPercent(item.holdout_baseline);
+  const lift = Number(item.holdout_lift || 0);
+  const liftText = lift > 0
+    ? `+${formatPercentagePoints(lift)}`
+    : formatPercentagePoints(lift);
+  const qValue = Number(item.holdout_q_value);
+  const qText = Number.isFinite(qValue)
+    ? `q ${qValue.toFixed(3)}`
+    : "q n/a";
+  const ciLow = Number(item.holdout_lift_ci_low);
+  const ciHigh = Number(item.holdout_lift_ci_high);
+  const ciText = Number.isFinite(ciLow) && Number.isFinite(ciHigh)
+    ? `CI ${formatPercentagePoints(ciLow)}..${formatPercentagePoints(ciHigh)}`
+    : "CI n/a";
+  const positiveFolds = Number(item.walk_forward_positive_folds);
+  const validFolds = Number(item.walk_forward_valid_folds);
+  const significantFolds = Number(item.walk_forward_significant_positive_folds);
+  const walkText = Number.isFinite(positiveFolds) && Number.isFinite(validFolds)
+    ? `WF ${positiveFolds}/${validFolds}+${Number.isFinite(significantFolds) ? `, sig ${significantFolds}` : ""}`
+    : "WF n/a";
+
+  return `${rate} vs ${baseline} (${liftText}, ${qText}, ${walkText}, ${ciText})`;
+}
+
+function renderAiWatch(edgeAudit) {
+  if (
+    !elements.aiWatchPanel
+    || !elements.aiWatchStatus
+    || !elements.aiWatchMain
+    || !elements.aiWatchList
+  ) {
+    return;
+  }
+
+  elements.aiWatchPanel.classList.remove("active", "watch", "empty");
+  elements.aiWatchList.innerHTML = "";
+
+  if (!edgeAudit || !edgeAudit.available) {
+    elements.aiWatchPanel.classList.add("empty");
+    elements.aiWatchStatus.textContent = "No audit yet";
+    elements.aiWatchMain.textContent = edgeAudit && edgeAudit.message
+      ? edgeAudit.message
+      : "Run edge audit to search for watch patterns.";
+    return;
+  }
+
+  const active = Array.isArray(edgeAudit.active) ? edgeAudit.active : [];
+  const watch = Array.isArray(edgeAudit.watch) ? edgeAudit.watch : [];
+  const bestActive = active[0] || null;
+  const hasConfirmed = Number(edgeAudit.fdr_confirmed_count || 0) > 0;
+  const hasStable = Number(edgeAudit.walk_forward_stable_count || 0) > 0;
+  const hasRawWatch = Number(edgeAudit.watch_candidate_count || 0) > 0;
+  const testedText = edgeAudit.patterns_tested
+    ? `${edgeAudit.patterns_tested} patterns tested`
+    : "Patterns tested";
+  const foldText = edgeAudit.walk_forward_folds
+    ? `${edgeAudit.walk_forward_folds} time windows`
+    : "walk-forward windows";
+
+  if (bestActive) {
+    elements.aiWatchPanel.classList.add("active");
+    elements.aiWatchStatus.textContent = bestActive.walk_forward_stable || bestActive.strong_edge
+      ? "Stable watch active"
+      : bestActive.fdr_confirmed
+        ? "Confirmed watch active"
+        : "Unconfirmed watch active";
+    elements.aiWatchMain.textContent = `${bestActive.condition} -> ${bestActive.target}x+`;
+  } else if (hasStable) {
+    elements.aiWatchPanel.classList.add("watch");
+    elements.aiWatchStatus.textContent = "Stable watch found";
+    elements.aiWatchMain.textContent = `No stable pattern active now. ${testedText}, ${foldText}.`;
+  } else if (hasConfirmed) {
+    elements.aiWatchPanel.classList.add("watch");
+    elements.aiWatchStatus.textContent = "Confirmed but unstable";
+    elements.aiWatchMain.textContent = `No confirmed pattern active now. ${testedText}, ${foldText}.`;
+  } else if (hasRawWatch) {
+    elements.aiWatchPanel.classList.add("watch");
+    elements.aiWatchStatus.textContent = "No proven edge";
+    elements.aiWatchMain.textContent = `Weak hints only. They did not pass confirmation across ${foldText}.`;
+  } else {
+    elements.aiWatchPanel.classList.add("empty");
+    elements.aiWatchStatus.textContent = "No proven edge";
+    elements.aiWatchMain.textContent = edgeAudit.conclusion || `No repeatable watch pattern found. ${testedText}.`;
+  }
+
+  const rows = active.length ? active : watch.slice(0, 3);
+
+  for (const item of rows) {
+    const row = document.createElement("div");
+    row.className = `ai-watch-row ${item.active ? "active" : ""}`;
+
+    const label = document.createElement("span");
+    label.textContent = `${item.condition} -> ${item.target}x+`;
+
+    const detail = document.createElement("small");
+    detail.textContent = edgeAuditRateText(item);
+
+    row.appendChild(label);
+    row.appendChild(detail);
+    elements.aiWatchList.appendChild(row);
   }
 }
 
@@ -1102,6 +2039,33 @@ function renderSourceMode(selection) {
   }
 
   elements.sourceModeText.textContent = `Data: ${formatCount(selection.source_rounds)} game rounds saved`;
+}
+
+function renderCollectorStatus(status) {
+  if (!elements.collectorStatusText) {
+    return;
+  }
+
+  if (!status || !status.available) {
+    elements.collectorStatusText.textContent = "Game: waiting for live state";
+    elements.collectorStatusText.className = "collector-status";
+    return;
+  }
+
+  const phase = String(status.phase || "");
+  const label = status.label || "Game state detected";
+  const multiplier = status.live_multiplier !== null && status.live_multiplier !== undefined
+    ? ` ${formatMultiplier(status.live_multiplier)}`
+    : "";
+  const age = status.age_seconds !== null && status.age_seconds !== undefined
+    ? ` - ${formatAge(status.age_seconds)} ago`
+    : "";
+  const realtime = status.realtime_channels && status.realtime_channels.available
+    ? " - realtime connected"
+    : "";
+
+  elements.collectorStatusText.textContent = `Game: ${label}${multiplier}${age}${realtime}`;
+  elements.collectorStatusText.className = `collector-status ${phase || "unknown"}`;
 }
 
 function participantContextParts(participants) {
@@ -1501,9 +2465,22 @@ function renderFastPrediction(data) {
     elements.fastPredictionText.textContent = "Waiting for live data";
     elements.fastPredictionMeta.textContent = `Last round ${formatAge(data.ingest.last_round_age_seconds)} ago`;
     elements.signalStrengthText.textContent = "Confidence: paused";
-    elements.bigWatchText.textContent = "High round chance: waiting";
+    elements.bigWatchText.textContent = "Big round alert: waiting";
     elements.fastSignalText.textContent = liveDataLabel(data);
     elements.cashoutGuideText.textContent = liveDataDetail(data, "wait for live data");
+    return;
+  }
+
+  const selectiveDisplay = buildSelectiveFastDisplay(data.signal_quality);
+
+  if (selectiveDisplay) {
+    elements.fastMain.classList.add(selectiveDisplay.tone);
+    elements.fastPredictionText.textContent = selectiveDisplay.text;
+    elements.fastPredictionMeta.textContent = selectiveDisplay.meta;
+    elements.signalStrengthText.textContent = selectiveDisplay.signal;
+    elements.bigWatchText.textContent = selectiveDisplay.bigWatch;
+    elements.fastSignalText.textContent = liveDataLabel(data);
+    elements.cashoutGuideText.textContent = liveDataDetail(data, selectiveDisplay.cashout);
     return;
   }
 
@@ -1524,7 +2501,7 @@ function renderFastPrediction(data) {
     elements.fastPredictionText.textContent = "Waiting";
     elements.fastPredictionMeta.textContent = "Collecting prediction data";
     elements.signalStrengthText.textContent = "Confidence: waiting";
-    elements.bigWatchText.textContent = "High round chance: waiting";
+    elements.bigWatchText.textContent = "Big round alert: waiting";
     elements.fastSignalText.textContent = liveDataLabel(data);
     elements.cashoutGuideText.textContent = liveDataDetail(data, "prediction loading");
     return;
@@ -1844,9 +2821,17 @@ function render(data) {
 
   renderFastPrediction(data);
   renderSourceMode(data.data_selection);
+  renderCollectorStatus(data.collector_status);
   renderRoundContext(data.round_context);
+  renderSignalQuality(data.signal_quality);
+  renderDataQuality(data.data_quality);
+  renderSequenceWatch(data.sequence_watch);
+  renderAiWatch(data.edge_audit);
   renderBigRounds(data.big_rounds);
+  renderTimingInsights(data.timing_insights);
   renderMlPrediction(data.ml_prediction, data.ml_retrain);
+  renderModelHealth(data);
+  renderStrategyAudit(data.strategy_audit);
   renderAccuracySummary(data.accuracy_summary);
   if (elements.predictionList.offsetParent !== null) {
     renderPredictionList(data.next_round.predictions);
@@ -1901,11 +2886,32 @@ function buildRenderSignature(data) {
   const mlPrediction = data.ml_prediction || {};
   const mlEntries = mlPredictionEntries(mlPrediction);
   const mlRetrain = data.ml_retrain || {};
+  const collectorStatus = data.collector_status || {};
+  const timing = data.timing_insights || {};
+  const signalQuality = data.signal_quality || {};
+  const dataQuality = data.data_quality || {};
+  const dataQualityIntervals = dataQuality.intervals || {};
+  const dataQualityRecentIntervals = dataQuality.recent_intervals || {};
+  const edgeAudit = data.edge_audit || {};
+  const strategyAudit = data.strategy_audit || {};
+  const bestStrategy = strategyAudit.best_train_strategy || {};
+  const forwardStrategy = strategyAudit.best_forward_candidate || {};
+  const sequenceWatch = data.sequence_watch || {};
 
   return JSON.stringify({
     rounds: summary.rounds,
     latest: summary.latest_multiplier,
     age: ingest.last_round_age_seconds,
+    gamePhase: collectorStatus.phase,
+    gameLiveMultiplier: collectorStatus.live_multiplier,
+    gameStatusAge: collectorStatus.age_seconds,
+    gameObservedAt: collectorStatus.observed_at,
+    realtimeChannels: collectorStatus.realtime_channels
+      ? [
+          collectorStatus.realtime_channels.total,
+          collectorStatus.realtime_channels.observed_at,
+        ]
+      : null,
     radarAt: radar.observed_at || context.observed_at,
     radarPlayers: radar.player_count || context.player_count,
     participantsAt: participants.observed_at,
@@ -1927,6 +2933,145 @@ function buildRenderSignature(data) {
       item.count,
       item.last ? item.last.round_number : null,
     ]),
+    timingMessage: timing.message,
+    timingWindows: (timing.top_windows || []).map((item) => [
+      item.label,
+      item.rounds,
+      item.score,
+      item.rates && item.rates["2.00"],
+      item.rates && item.rates["5.00"],
+      item.rates && item.rates["10.00"],
+    ]),
+    timingSameTimeLastWeek: timing.same_time_last_week
+      ? [
+          timing.same_time_last_week.available,
+          timing.same_time_last_week.anchor_timestamp,
+          timing.same_time_last_week.last_week_timestamp,
+          (timing.same_time_last_week.windows || []).map((item) => [
+            item.label,
+            item.current && item.current.rounds,
+            item.last_week && item.last_week.rounds,
+            item.current && item.current.rates && item.current.rates["2.00"],
+            item.last_week && item.last_week.rates && item.last_week.rates["2.00"],
+            item.current && item.current.rates && item.current.rates["5.00"],
+            item.last_week && item.last_week.rates && item.last_week.rates["5.00"],
+            item.current && item.current.rates && item.current.rates["10.00"],
+            item.last_week && item.last_week.rates && item.last_week.rates["10.00"],
+          ]),
+        ]
+      : null,
+    signalQualityStatus: signalQuality.status,
+    signalQualityScore: signalQuality.score,
+    signalQualityHeadline: signalQuality.headline,
+    signalQualityReasons: (signalQuality.reasons || []).map((item) => [
+      item.label,
+      item.detail,
+      item.tone,
+    ]),
+    dataQualityStatus: dataQuality.status,
+    dataQualityScore: dataQuality.score,
+    dataQualityValidRows: dataQuality.valid_rows,
+    dataQualityDuplicates: dataQuality.duplicate_exact_count,
+    dataQualityPossibleNoIdDuplicates: dataQuality.possible_no_id_duplicate_count,
+    dataQualityRecentGaps: dataQualityRecentIntervals.possible_capture_gap_count,
+    dataQualityOldGaps: dataQualityIntervals.possible_capture_gap_count,
+    dataQualityMedianGap: dataQualityIntervals.median_seconds,
+    dataQualityIssues: (dataQuality.issues || []).map((item) => [
+      item.severity,
+      item.label,
+      item.detail,
+    ]),
+    sequenceWatchGeneratedAt: sequenceWatch.generated_at,
+    sequenceWatchCurrent: (sequenceWatch.current_sequences || []).map((item) => [
+      item.key,
+      item.label,
+    ]),
+    sequenceWatchActive: (sequenceWatch.active || []).map((item) => [
+      item.pattern_key,
+      item.outcome_key,
+      item.status,
+      item.holdout_rate,
+      item.holdout_lift,
+      item.holdout_q_value,
+      item.walk_forward_valid_folds,
+      item.walk_forward_positive_folds,
+      item.walk_forward_significant_positive_folds,
+    ]),
+    sequenceWatchWeakActive: (sequenceWatch.weak_active || []).map((item) => [
+      item.pattern_key,
+      item.outcome_key,
+      item.status,
+      item.holdout_rate,
+      item.holdout_lift,
+      item.holdout_q_value,
+      item.walk_forward_valid_folds,
+      item.walk_forward_positive_folds,
+      item.walk_forward_significant_positive_folds,
+    ]),
+    sequenceWatchConfirmed: (sequenceWatch.confirmed || []).slice(0, 3).map((item) => [
+      item.pattern_key,
+      item.outcome_key,
+      item.status,
+      item.holdout_rate,
+      item.holdout_lift,
+      item.holdout_q_value,
+      item.walk_forward_valid_folds,
+      item.walk_forward_positive_folds,
+      item.walk_forward_significant_positive_folds,
+    ]),
+    sequenceWatchWatch: (sequenceWatch.watch || []).slice(0, 3).map((item) => [
+      item.pattern_key,
+      item.outcome_key,
+      item.status,
+      item.holdout_rate,
+      item.holdout_lift,
+      item.holdout_q_value,
+      item.walk_forward_valid_folds,
+      item.walk_forward_positive_folds,
+      item.walk_forward_significant_positive_folds,
+    ]),
+    edgeAuditGeneratedAt: edgeAudit.generated_at,
+    edgeAuditActive: (edgeAudit.active || []).map((item) => [
+      item.condition,
+      item.target,
+      item.holdout_rate,
+      item.holdout_lift,
+      item.holdout_q_value,
+      item.holdout_lift_ci_low,
+      item.holdout_lift_ci_high,
+      item.fdr_confirmed,
+      item.walk_forward_stable,
+      item.walk_forward_valid_folds,
+      item.walk_forward_positive_folds,
+      item.walk_forward_significant_positive_folds,
+    ]),
+    edgeAuditWatch: (edgeAudit.watch || []).slice(0, 3).map((item) => [
+      item.condition,
+      item.target,
+      item.holdout_rate,
+      item.holdout_lift,
+      item.holdout_q_value,
+      item.holdout_lift_ci_low,
+      item.holdout_lift_ci_high,
+      item.fdr_confirmed,
+      item.walk_forward_stable,
+      item.walk_forward_valid_folds,
+      item.walk_forward_positive_folds,
+      item.walk_forward_significant_positive_folds,
+    ]),
+    strategyAuditStatus: strategyAudit.status,
+    strategyAuditRounds: strategyAudit.rounds,
+    strategyAuditNewRounds: strategyAudit.new_rounds,
+    bestStrategy: [
+      bestStrategy.label,
+      bestStrategy.train && bestStrategy.train.roi,
+      bestStrategy.holdout && bestStrategy.holdout.roi,
+    ],
+    forwardStrategy: [
+      forwardStrategy.label,
+      forwardStrategy.train && forwardStrategy.train.roi,
+      forwardStrategy.holdout && forwardStrategy.holdout.roi,
+    ],
     rangeLabel: range.short || range.label,
     rangeSignal: range.clear_signal,
     rangeTarget: range.target_confidence,
@@ -1954,6 +3099,13 @@ function buildRenderSignature(data) {
     mlRetrainRemaining: mlRetrain.rounds_until_next_train,
     mlRetrainSuccessAt: mlRetrain.last_success_at,
     mlRetrainError: mlRetrain.last_error,
+    mlRetrainMessage: mlRetrain.last_message,
+    mlPromotedTargets: mlRetrain.promoted_targets || [],
+    mlKeptTargets: (mlRetrain.kept_targets || []).map((item) => [
+      item.target,
+      item.candidate_model,
+      item.reason,
+    ]),
     mlLiveMetric: mlLiveMetricText(mlRetrain),
     mlPredictions: mlEntries.map((item) => [
       item.target,

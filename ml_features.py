@@ -26,7 +26,7 @@ DATA_DIR = ROOT / "data"
 DEFAULT_ROUNDS_PATH = DATA_DIR / "rounds.csv"
 DEFAULT_CONTEXT_PATH = DATA_DIR / "round_context.csv"
 
-FEATURE_SCHEMA_VERSION = "multiplier-history-v1"
+FEATURE_SCHEMA_VERSION = "multiplier-history-time-context-v3"
 DEFAULT_TARGETS = [1.5, 2.0, 3.0, 5.0, 10.0]
 ROLLING_WINDOWS = [3, 5, 10, 20, 50, 100]
 MAX_LAG = 50
@@ -318,8 +318,52 @@ def add_pattern_features(features: pd.DataFrame, values: np.ndarray) -> None:
     features["bucket_pattern_10"] = pattern_10
 
 
+def add_previous_time_features(features: pd.DataFrame, rounds: pd.DataFrame) -> None:
+    """Add time features known at prediction time.
+
+    Use the previous round timestamp, not the target round timestamp, because
+    the target crash timestamp is only known after the target result.
+    """
+
+    previous_time = rounds["timestamp_dt"].shift(1)
+    previous_previous_time = rounds["timestamp_dt"].shift(2)
+    known = previous_time.notna()
+    hour = previous_time.dt.hour.fillna(0).astype(float)
+    minute = previous_time.dt.minute.fillna(0).astype(float)
+    second = previous_time.dt.second.fillna(0).astype(float)
+    minute_of_day = hour * 60 + minute + second / 60
+    weekday = previous_time.dt.weekday.fillna(0).astype(float)
+    previous_gap_seconds = (
+        (previous_time - previous_previous_time)
+        .dt.total_seconds()
+        .clip(lower=0, upper=300)
+        .fillna(0.0)
+    )
+
+    features["time_previous_known"] = known.astype(int)
+    features["time_hour_sin"] = np.sin(2 * np.pi * hour / 24)
+    features["time_hour_cos"] = np.cos(2 * np.pi * hour / 24)
+    features["time_minute_of_day_sin"] = np.sin(2 * np.pi * minute_of_day / 1440)
+    features["time_minute_of_day_cos"] = np.cos(2 * np.pi * minute_of_day / 1440)
+    features["time_weekday_sin"] = np.sin(2 * np.pi * weekday / 7)
+    features["time_weekday_cos"] = np.cos(2 * np.pi * weekday / 7)
+    features["time_is_weekend"] = previous_time.dt.weekday.isin([5, 6]).astype(int)
+    features["time_prev_gap_seconds"] = previous_gap_seconds
+    features["time_prev_gap_log"] = np.log1p(previous_gap_seconds)
+
+    for window in (5, 20, 100):
+        rolling = previous_gap_seconds.rolling(window=window, min_periods=1)
+        features[f"time_gap_roll_{window}_mean"] = rolling.mean().fillna(0.0)
+        features[f"time_gap_roll_{window}_max"] = rolling.max().fillna(0.0)
+
+
 def build_context_features(rounds: pd.DataFrame, context_path: Path) -> pd.DataFrame:
-    """Attach optional context rows observed before the target round timestamp."""
+    """Attach optional context known after the previous completed round.
+
+    Joining on the target round crash timestamp can leak in-round participant
+    or cashout information. For a next-round prediction, only context observed
+    no later than the previous completed round is safe.
+    """
 
     output = pd.DataFrame(index=rounds.index)
     if not Path(context_path).exists() or rounds.empty:
@@ -343,13 +387,18 @@ def build_context_features(rounds: pd.DataFrame, context_path: Path) -> pd.DataF
             context[field] = np.nan
         context[field] = pd.to_numeric(context[field], errors="coerce")
 
-    left = rounds[["timestamp_dt"]].copy()
+    left = pd.DataFrame(
+        {
+            "prediction_dt": rounds["timestamp_dt"].shift(1),
+        },
+        index=rounds.index,
+    )
     left["_row_index"] = rounds.index
-    left = left.dropna(subset=["timestamp_dt"]).sort_values("timestamp_dt")
+    left = left.dropna(subset=["prediction_dt"]).sort_values("prediction_dt")
     merged = pd.merge_asof(
         left,
         context[["observed_dt", *CONTEXT_FIELDS]],
-        left_on="timestamp_dt",
+        left_on="prediction_dt",
         right_on="observed_dt",
         direction="backward",
         allow_exact_matches=False,
@@ -440,6 +489,7 @@ def generate_features(
 
     add_streak_features(features, values)
     add_pattern_features(features, values)
+    add_previous_time_features(features, rounds)
 
     if include_context:
         context_features = build_context_features(rounds, Path(context_path))

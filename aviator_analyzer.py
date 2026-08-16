@@ -187,12 +187,12 @@ def parse_round_time(value):
 
 
 def load_rounds(path):
-    rounds = []
+    raw_rounds = []
 
     with path.open("r", newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
 
-        for row in reader:
+        for original_index, row in enumerate(reader):
             try:
                 multiplier = float(row["multiplier"])
             except (KeyError, TypeError, ValueError):
@@ -204,25 +204,10 @@ def load_rounds(path):
             timestamp = row.get("timestamp", "")
             current_time = parse_round_time(timestamp)
 
-            if rounds:
-                previous = rounds[-1]
-                previous_time = parse_round_time(
-                    previous.get("timestamp", "")
-                )
-
-                if (
-                    round(float(previous["multiplier"]), 2)
-                    == round(multiplier, 2)
-                    and current_time is not None
-                    and previous_time is not None
-                    and abs((current_time - previous_time).total_seconds())
-                    <= DEDUPLICATE_WINDOW_SECONDS
-                ):
-                    continue
-
-            rounds.append(
+            raw_rounds.append(
                 {
                     "timestamp": timestamp,
+                    "timestamp_dt": current_time,
                     "multiplier": multiplier,
                     "round_id": row.get(
                         "round_id",
@@ -232,8 +217,56 @@ def load_rounds(path):
                         "source",
                         ""
                     ),
+                    "original_index": original_index,
                 }
             )
+
+    raw_rounds.sort(
+        key=lambda item: (
+            item["timestamp_dt"] is None,
+            item["timestamp_dt"] or datetime.max,
+            item["original_index"],
+        )
+    )
+
+    rounds = []
+    seen_round_ids = set()
+
+    for row in raw_rounds:
+        round_id = row.get("round_id", "")
+
+        if round_id:
+            if round_id in seen_round_ids:
+                continue
+
+            seen_round_ids.add(round_id)
+
+        if rounds:
+            current_time = row.get("timestamp_dt")
+            multiplier = row.get("multiplier")
+            previous = rounds[-1]
+            previous_time = parse_round_time(
+                previous.get("timestamp", "")
+            )
+
+            if (
+                round(float(previous["multiplier"]), 2)
+                == round(multiplier, 2)
+                and current_time is not None
+                and previous_time is not None
+                and abs((current_time - previous_time).total_seconds())
+                <= DEDUPLICATE_WINDOW_SECONDS
+            ):
+                continue
+
+        rounds.append(
+            {
+                "timestamp": row.get("timestamp", ""),
+                "multiplier": row.get("multiplier"),
+                "round_id": round_id,
+                "source": row.get("source", ""),
+            }
+        )
 
     return rounds
 
